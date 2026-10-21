@@ -74,8 +74,20 @@ class MiningInfoV1 : public MiningInfoBase {
 
     bm_job* buildBmJob(uint32_t /*extranonce_2*/, int pool_id, uint32_t asic_diff) override
     {
-        // Her havuzun kendi yapılandırılmış extranonce_2_len değerini tam olarak kullanıyoruz
-        int current_e2_len = extranonce_2_len;
+        int max_len = extranonce_2_len;
+        int current_e2_len = max_len;
+
+        // Havuz bazlı net ayrım: 4 baytlık havuz kuralı gereği sabit kalır, 8 baytlık havuz esnektir.
+        if (max_len == 4 || pool_id == 1) { 
+            current_e2_len = 4; // BTC PoW Lab için tam 4 bayt şart (hata önleyici)
+        } else {
+            // Solofury için 1 bayttan max sınıra kadar her job'da rastgele değişim
+            if (max_len > 1) {
+                current_e2_len = (esp_random() % max_len) + 1;
+            } else {
+                current_e2_len = max_len;
+            }
+        }
 
         char extranonce_2_str[65] = {0};
         uint8_t extranonce_2_bin[32] = {0};
@@ -83,6 +95,7 @@ class MiningInfoV1 : public MiningInfoBase {
         if (current_e2_len > 0) {
             size_t e2_len = (current_e2_len > 32) ? 32 : (size_t)current_e2_len;
             
+            // Rastgele baytlar üret
             for (size_t i = 0; i < e2_len; i += 4) {
                 uint32_t rand_val = esp_random();
                 size_t chunk = (e2_len - i < 4) ? (e2_len - i) : 4;
@@ -91,6 +104,7 @@ class MiningInfoV1 : public MiningInfoBase {
                 }
             }
             
+            // Heksadesimal formata çevir
             for (size_t i = 0; i < e2_len; i++) {
                 sprintf(&extranonce_2_str[i * 2], "%02x", extranonce_2_bin[i]);
             }
