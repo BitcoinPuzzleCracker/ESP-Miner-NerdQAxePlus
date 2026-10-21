@@ -74,11 +74,19 @@ class MiningInfoV1 : public MiningInfoBase {
 
     bm_job* buildBmJob(uint32_t /*extranonce_2*/, int pool_id, uint32_t asic_diff) override
     {
-        char extranonce_2_str[extranonce_2_len * 2 + 1];
+        // Bepaal een dynamische willekeurige lengte voor extranonce_2 (in bytes)
+        int current_e2_len = extranonce_2_len;
+        if (extranonce_2_len > 1) {
+            current_e2_len = (esp_random() % extranonce_2_len) + 1;
+        } else if (extranonce_2_len <= 0) {
+            current_e2_len = 0;
+        }
+
+        char extranonce_2_str[65] = {0};
         uint8_t extranonce_2_bin[32] = {0};
 
-        if (extranonce_2_len > 0) {
-            size_t e2_len = (extranonce_2_len > 32) ? 32 : (size_t)extranonce_2_len;
+        if (current_e2_len > 0) {
+            size_t e2_len = (current_e2_len > 32) ? 32 : (size_t)current_e2_len;
             // Genereer willekeurige bytes binnen de toegestane extranonce2 lengte
             for (size_t i = 0; i < e2_len; i += 4) {
                 uint32_t rand_val = esp_random();
@@ -356,7 +364,6 @@ void create_jobs_task(void *pvParameters)
             }
 
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
-            // Doorgeven van 0 als extranonce2, aangezien deze nu willekeurig in buildBmJob wordt aangemaakt
             next_job = mi->buildBmJob(0, active_pool, asic_diff);
         } 
 
