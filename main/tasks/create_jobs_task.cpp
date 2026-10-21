@@ -74,21 +74,15 @@ class MiningInfoV1 : public MiningInfoBase {
 
     bm_job* buildBmJob(uint32_t /*extranonce_2*/, int pool_id, uint32_t asic_diff) override
     {
-        // Automatische detectie: respecteer strikt 4 bytes als de pool dat eist (zoals BTC PoW Lab),
-        // anders variëren we willekeurig tussen 4 bytes en de maximale lengte (zoals bij de solopool).
+        // Her havuzun kendi yapılandırılmış extranonce_2_len değerini tam olarak kullanıyoruz
         int current_e2_len = extranonce_2_len;
-        if (extranonce_2_len > 4) {
-            current_e2_len = 4 + (esp_random() % (extranonce_2_len - 3));
-        } else {
-            current_e2_len = extranonce_2_len;
-        }
 
         char extranonce_2_str[65] = {0};
         uint8_t extranonce_2_bin[32] = {0};
 
         if (current_e2_len > 0) {
             size_t e2_len = (current_e2_len > 32) ? 32 : (size_t)current_e2_len;
-            // Genereer willekeurige bytes binnen de toegestane extranonce2 lengte
+            
             for (size_t i = 0; i < e2_len; i += 4) {
                 uint32_t rand_val = esp_random();
                 size_t chunk = (e2_len - i < 4) ? (e2_len - i) : 4;
@@ -96,7 +90,7 @@ class MiningInfoV1 : public MiningInfoBase {
                     extranonce_2_bin[i + j] = (rand_val >> (8 * j)) & 0xFF;
                 }
             }
-            // Omzetten naar hex string
+            
             for (size_t i = 0; i < e2_len; i++) {
                 sprintf(&extranonce_2_str[i * 2], "%02x", extranonce_2_bin[i]);
             }
