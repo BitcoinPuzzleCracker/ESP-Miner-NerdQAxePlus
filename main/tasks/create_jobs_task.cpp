@@ -69,11 +69,11 @@ class MiningInfoV1 : public MiningInfoBase {
         }
     }
 
-    // --- MiningInfoBase interface ---
+    // --- MiningInfoBase interface (uint64_t) ---
 
     bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
-        // 4 veya 8 bayt durumuna göre hex string formatı (%0*llx)
+        // 4 veya 8 bayt otomatik format (%0*llx)
         char extranonce_2_str[extranonce_2_len * 2 + 1]; 
         snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%0*llx", (int) extranonce_2_len * 2, (unsigned long long) extranonce_2);
 
@@ -330,10 +330,12 @@ void create_jobs_task(void *pvParameters)
 
             MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
 
-            // --- OTOMATİK SEÇİM: Havuz 8 bayt isterse 64-bit, 4 bayt isterse 32-bit random ---
+            // --- OTOMATİK 4 VEYA 8 BAYT UNIFORM RANDOM SEÇİMİ ---
             if (v1_info->extranonce_2_len > 4) {
+                // 8 Bayt (64-bit): 0 ile 0xFFFFFFFFFFFFFFFF arasında tam rastgele
                 extranonce_2 = ((uint64_t)esp_random() << 32) | esp_random();
             } else {
+                // 4 Bayt (32-bit): 0 ile 0xFFFFFFFF arasında tam rastgele
                 extranonce_2 = (uint64_t)esp_random();
             }
 
