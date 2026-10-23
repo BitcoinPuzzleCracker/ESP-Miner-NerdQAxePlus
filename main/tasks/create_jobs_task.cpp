@@ -31,18 +31,6 @@ pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 // MiningInfoBase - abstract interface for protocol-agnostic job construction
 // ============================================================================
 
-class MiningInfoBase {
-  public:
-    virtual ~MiningInfoBase();
-    virtual bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
-    virtual bool isValid() const = 0;
-    virtual bool isNewWork(uint32_t &last_ntime) const = 0;
-    virtual const char* getJobId() const = 0;
-    virtual uint32_t getActiveDifficulty() const = 0;
-    virtual uint32_t getVersionMask() const = 0;
-    virtual void invalidate() = 0;
-};
-
 MiningInfoBase::~MiningInfoBase() {}
 
 // ============================================================================
@@ -81,12 +69,12 @@ class MiningInfoV1 : public MiningInfoBase {
         }
     }
 
-    // --- MiningInfoBase interface ---
+    // --- MiningInfoBase interface (uint64_t destekli) ---
 
-    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
+    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_dest_diff) override
     {
-        // generate extranonce2 hex string (supports 4 or 8 bytes automatically)
-        char extranonce_2_str[extranonce_2_len * 2 + 1]; // +1 zero termination
+        // 4 veya 8 bayt durumuna göre hex string formatı (%0*llx)
+        char extranonce_2_str[extranonce_2_len * 2 + 1]; 
         snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%0*llx", (int) extranonce_2_len * 2, (unsigned long long) extranonce_2);
 
         // generate coinbase tx
@@ -102,14 +90,13 @@ class MiningInfoV1 : public MiningInfoBase {
                                    merkle_root);
         free(coinbase_tx);
 
-        // we need malloc because we will save it in the job array
         bm_job *next_job = (bm_job *) MALLOC(sizeof(bm_job));
         construct_bm_job(current_job, merkle_root, version_mask, next_job);
         next_job->jobid = strdup(current_job->job_id);
         next_job->extranonce2 = strdup(extranonce_2_str);
         next_job->pool_diff = active_stratum_difficulty;
         next_job->pool_id = pool_id;
-        next_job->asic_diff = asic_diff;
+        next_job->asic_diff = asic_dest_diff;
 
         return next_job;
     }
@@ -301,8 +288,6 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
-
-    // CAN: per-slave rolling counters
     uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
 
     int lastJobInterval = board->getAsicJobIntervalMs();
@@ -343,13 +328,12 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            // --- OTOMATİK UNIFORM RANDOM SEÇİMİ (4 veya 8 bayt) ---
             MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
+
+            // --- OTOMATİK SEÇİM: Havuz 8 bayt isterse 64-bit, 4 bayt isterse 32-bit random ---
             if (v1_info->extranonce_2_len > 4) {
-                // 8 Bayt (64-bit): 0 ile 0xFFFFFFFFFFFFFFFF arasında tam rastgele
                 extranonce_2 = ((uint64_t)esp_random() << 32) | esp_random();
             } else {
-                // 4 Bayt (32-bit): 0 ile 0xFFFFFFFF arasında tam rastgele
                 extranonce_2 = (uint64_t)esp_random();
             }
 
@@ -369,7 +353,6 @@ void create_jobs_task(void *pvParameters)
         }
         last_submit_time = current_time;
 
-        // Donanım sürücüsüne uyumlu olması için lower 32-bit veya değer aktarımı
         int asic_job_id = asics->sendWork((uint32_t)extranonce_2, next_job);
 
         ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X", active_pool_str, active_pool, asic_job_id);
@@ -389,13 +372,10 @@ void create_jobs_task(void *pvParameters)
                 if (mi->isValid()) {
                     MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
                     
-                    // Slave cihazlar için de havuzun boyutuna uygun rastgele seçim yapılır
                     if (v1_info->extranonce_2_len > 4) {
                         slave_enonce = ((uint64_t)esp_random() << 32) | esp_random();
                     } else {
-                        // Eğer 4 bayt ise slave sayacını da işin içine katarak özelleştirilmiş random veya saf random seçilebilir
-                        uint32_t e2 = can_make_extranonce2(slave, slave_counters[slave]++);
-                        slave_enonce = (uint64_t)e2;
+                        slave_enonce = (uint64_t)esp_random();
                     }
 
                     uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
