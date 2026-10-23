@@ -13,12 +13,12 @@ class MiningInfoBase {
   public:
     virtual ~MiningInfoBase();
 
-    // V1 ve 8-bayt desteği için 64-bit imza
-    virtual bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
+    // V2 sınıflarının uyumluluğu için 32-bit pure virtual imza
+    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
 
-    // V2 sınıflarının uyumluluğu bozulmasın diye 32-bit aşırı yükleme (overload)
-    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) {
-        return buildBmJob((uint64_t)extranonce_2, pool_id, asic_diff);
+    // V1 ve 8-bayt desteği için 64-bit sanal aşırı yükleme (overload)
+    virtual bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) {
+        return buildBmJob((uint32_t)extranonce_2, pool_id, asic_diff);
     }
 
     virtual bool isValid() const = 0;
