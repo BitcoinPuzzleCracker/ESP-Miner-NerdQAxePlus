@@ -8,16 +8,13 @@
 
 /**
  * @brief Abstract base class for protocol-agnostic mining job construction.
- *
- * Derived classes implement protocol-specific job building (V1 coinbase+merkle,
- * V2 standard channel, V2 extended channel) while the create_jobs_task loop
- * remains protocol-agnostic.
  */
 class MiningInfoBase {
   public:
     virtual ~MiningInfoBase();
 
-    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
+    // 4 ve 8 bayt (uint64_t) desteği için güncellendi
+    virtual bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
     virtual bool isValid() const = 0;
     virtual bool isNewWork(uint32_t &last_ntime) const = 0;
     virtual const char* getJobId() const = 0;
