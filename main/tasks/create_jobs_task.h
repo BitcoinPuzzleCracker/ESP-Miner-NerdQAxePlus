@@ -13,8 +13,14 @@ class MiningInfoBase {
   public:
     virtual ~MiningInfoBase();
 
-    // 4 ve 8 bayt (uint64_t) desteği için güncellendi
+    // V1 ve 8-bayt desteği için 64-bit imza
     virtual bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
+
+    // V2 sınıflarının uyumluluğu bozulmasın diye 32-bit aşırı yükleme (overload)
+    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) {
+        return buildBmJob((uint64_t)extranonce_2, pool_id, asic_diff);
+    }
+
     virtual bool isValid() const = 0;
     virtual bool isNewWork(uint32_t &last_ntime) const = 0;
     virtual const char* getJobId() const = 0;
