@@ -69,9 +69,9 @@ class MiningInfoV1 : public MiningInfoBase {
         }
     }
 
-    // --- MiningInfoBase interface (uint64_t destekli) ---
+    // --- MiningInfoBase interface ---
 
-    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_dest_diff) override
+    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
         // 4 veya 8 bayt durumuna göre hex string formatı (%0*llx)
         char extranonce_2_str[extranonce_2_len * 2 + 1]; 
@@ -96,7 +96,7 @@ class MiningInfoV1 : public MiningInfoBase {
         next_job->extranonce2 = strdup(extranonce_2_str);
         next_job->pool_diff = active_stratum_difficulty;
         next_job->pool_id = pool_id;
-        next_job->asic_diff = asic_dest_diff;
+        next_job->asic_diff = asic_diff;
 
         return next_job;
     }
