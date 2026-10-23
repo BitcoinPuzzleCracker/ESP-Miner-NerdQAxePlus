@@ -69,11 +69,18 @@ class MiningInfoV1 : public MiningInfoBase {
         }
     }
 
-    // --- MiningInfoBase interface (uint64_t) ---
+    // --- MiningInfoBase interface overrides ---
 
+    // 32-bit imza eşitlemesi
+    bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
+    {
+        return buildBmJob((uint64_t)extranonce_2, pool_id, asic_diff);
+    }
+
+    // 64-bit imza (4 bayt ve 8 bayt tam destekli)
     bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
-        // 4 veya 8 bayt otomatik format (%0*llx)
+        // 4 veya 8 bayt durumuna göre hex string formatı (%0*llx)
         char extranonce_2_str[extranonce_2_len * 2 + 1]; 
         snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%0*llx", (int) extranonce_2_len * 2, (unsigned long long) extranonce_2);
 
@@ -288,7 +295,6 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
-    uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
 
     int lastJobInterval = board->getAsicJobIntervalMs();
 
