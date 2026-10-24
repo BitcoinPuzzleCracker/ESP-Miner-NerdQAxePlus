@@ -50,6 +50,9 @@ class MiningInfoV1 : public MiningInfoBase {
     uint32_t stratum_difficulty = 8192;
     uint32_t active_stratum_difficulty = 8192;
     uint32_t version_mask = 0;
+    
+    // Duplicate önlemek için ntime sayaç kaydırması
+    uint32_t ntime_offset = 0;
 
   public:
     MiningInfoV1()
@@ -92,8 +95,13 @@ class MiningInfoV1 : public MiningInfoBase {
                                    merkle_root);
         free(coinbase_tx);
 
+        // ntime değerine küçük bir offset ekleyerek her işi benzersiz kılıyoruz (Duplicate önleyici)
+        mining_notify modified_job;
+        memcpy(&modified_job, current_job, sizeof(mining_notify));
+        modified_job.ntime = current_job->ntime + ntime_offset;
+
         bm_job *next_job = (bm_job *) MALLOC(sizeof(bm_job));
-        construct_bm_job(current_job, merkle_root, version_mask, next_job);
+        construct_bm_job(&modified_job, merkle_root, version_mask, next_job);
         next_job->jobid = strdup(current_job->job_id);
         next_job->extranonce2 = strdup(extranonce_2_str);
         next_job->pool_diff = active_stratum_difficulty;
@@ -136,6 +144,7 @@ class MiningInfoV1 : public MiningInfoBase {
     void invalidate() override
     {
         current_job->ntime = 0;
+        ntime_offset = 0;
         safe_free(extranonce_str);
         safe_free(next_extranonce_str);
         safe_free(current_job->job_id);
@@ -188,6 +197,8 @@ class MiningInfoV1 : public MiningInfoBase {
         current_job->coinbase_1 = strdup(notify->coinbase_1);
         current_job->coinbase_2 = strdup(notify->coinbase_2);
 
+        // Yeni notify geldiğinde offset sıfırlanır
+        ntime_offset = 0;
         active_stratum_difficulty = stratum_difficulty;
     }
 };
@@ -249,7 +260,6 @@ void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
     {
         PThreadGuard g(current_stratum_job_mutex);
-        // Yeni job geldiğinde eski işleri tamamen temizlemesi için abandonWork zorunlu kılınmıştır
         asicJobs.cleanJobs(pool);
         ensureV1(pool)->create_job_mining_notify(notify);
     }
@@ -315,8 +325,7 @@ void create_jobs_task(void *pvParameters)
         active_pool = STRATUM_MANAGER->getNextActivePool();
         active_pool_str = active_pool ? "Sec" : "Pri";
 
-        // Extranonce 2 tamamen 0 sabitlendi
-        uint64_t extranonce_2 = 0;
+        uint64_t extranonce_2 = 0; // Sabit 0
 
         { 
             PThreadGuard g(current_stratum_job_mutex);
@@ -326,14 +335,18 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            // Extranonce 2 her zaman 0 olarak verilir
-            extranonce_2 = 0;
+            MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
+            extranonce_2 = 0; // Kesinlikle 0 sabit
 
             if (mi->isNewWork(last_ntime[active_pool])) {
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
-                
-                // Yeni iş (New Work) geldiğinde asic üzerindeki eski kuyruğu da sıfırlayarak baştan başlarız
                 asicJobs.cleanJobs(active_pool);
+            } else {
+                // Aynı job üzerinde dönerken ntime offset'i artırarak duplicate'i önle
+                v1_info->ntime_offset++;
+                if (v1_info->ntime_offset > 60) {
+                    v1_info->ntime_offset = 1; // Çok fazla kaymasın, 60 saniye içinde dönsün
+                }
             }
 
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
@@ -359,14 +372,13 @@ void create_jobs_task(void *pvParameters)
             if (!can_master_is_slave_active(slave)) continue;
 
             bm_job *slave_job = nullptr;
-            uint64_t slave_enonce = 0; // Slave cihazlar için de extranonce 2 sıfır sabitlenir
+            uint64_t slave_enonce = 0;
 
             {
                 PThreadGuard g(current_stratum_job_mutex);
                 MiningInfoBase *mi = miningInfo[active_pool];
                 if (mi->isValid()) {
                     slave_enonce = 0;
-
                     uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
                     slave_job = mi->buildBmJob(slave_enonce, active_pool, asic_diff);
                 }
