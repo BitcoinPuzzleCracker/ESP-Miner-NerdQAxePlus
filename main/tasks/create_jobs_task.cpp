@@ -249,9 +249,8 @@ void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
     {
         PThreadGuard g(current_stratum_job_mutex);
-        if (abandonWork) {
-            asicJobs.cleanJobs(pool);
-        }
+        // Yeni job geldiğinde eski işleri tamamen temizlemesi için abandonWork zorunlu kılınmıştır
+        asicJobs.cleanJobs(pool);
         ensureV1(pool)->create_job_mining_notify(notify);
     }
     trigger_job_creation();
@@ -327,11 +326,14 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            // Extranonce 2 her zaman 0 olarak işlenir
+            // Extranonce 2 her zaman 0 olarak verilir
             extranonce_2 = 0;
 
             if (mi->isNewWork(last_ntime[active_pool])) {
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
+                
+                // Yeni iş (New Work) geldiğinde asic üzerindeki eski kuyruğu da sıfırlayarak baştan başlarız
+                asicJobs.cleanJobs(active_pool);
             }
 
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
