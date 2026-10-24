@@ -71,27 +71,22 @@ class MiningInfoV1 : public MiningInfoBase {
 
     // --- MiningInfoBase interface overrides ---
 
-    // 32-bit imza eşitlemesi
     bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
         return buildBmJob((uint64_t)extranonce_2, pool_id, asic_diff);
     }
 
-    // 64-bit imza (4 bayt ve 8 bayt tam destekli)
     bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
-        // 4 veya 8 bayt durumuna göre hex string formatı (%0*llx)
         char extranonce_2_str[extranonce_2_len * 2 + 1]; 
         snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%0*llx", (int) extranonce_2_len * 2, (unsigned long long) extranonce_2);
 
-        // generate coinbase tx
         int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) + strlen(extranonce_2_str) +
                               strlen(current_job->coinbase_2);
         char *coinbase_tx = (char *) MALLOC(coinbase_tx_len + 1);
         snprintf(coinbase_tx, coinbase_tx_len + 1, "%s%s%s%s", current_job->coinbase_1, extranonce_str,
                  extranonce_2_str, current_job->coinbase_2);
 
-        // calculate merkle root
         char merkle_root[65];
         calculate_merkle_root_hash(coinbase_tx, current_job->_merkle_branches, current_job->n_merkle_branches,
                                    merkle_root);
@@ -148,8 +143,6 @@ class MiningInfoV1 : public MiningInfoBase {
         safe_free(current_job->coinbase_2);
     }
 
-    // --- V1-specific methods ---
-
     void set_version_mask(uint32_t mask)
     {
         version_mask = mask;
@@ -199,7 +192,6 @@ class MiningInfoV1 : public MiningInfoBase {
     }
 };
 
-// Global mining info instances - one per pool slot
 static MiningInfoV1 s_miningInfoV1[2] = {MiningInfoV1{}, MiningInfoV1{}};
 MiningInfoBase* miningInfo[2] = {&s_miningInfoV1[0], &s_miningInfoV1[1]};
 
@@ -295,6 +287,7 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
+    uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
 
     int lastJobInterval = board->getAsicJobIntervalMs();
 
@@ -336,13 +329,23 @@ void create_jobs_task(void *pvParameters)
 
             MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
 
-            // --- OTOMATİK 4 VEYA 8 BAYT UNIFORM RANDOM SEÇİMİ ---
+            // --- DENGELİ (HYBRID) RANDOM SEÇİMİ ---
+            uint32_t chance = esp_random() % 100;
+
             if (v1_info->extranonce_2_len > 4) {
-                // 8 Bayt (64-bit): 0 ile 0xFFFFFFFFFFFFFFFF arasında tam rastgele
-                extranonce_2 = ((uint64_t)esp_random() << 32) | esp_random();
+                if (chance < 15) {
+                    extranonce_2 = (uint64_t)(esp_random() & 0xFFFF); // Küçük değerler
+                } else if (chance < 35) {
+                    extranonce_2 = (uint64_t)esp_random(); // Orta değerler
+                } else {
+                    extranonce_2 = ((uint64_t)esp_random() << 32) | esp_random(); // Büyük değerler
+                }
             } else {
-                // 4 Bayt (32-bit): 0 ile 0xFFFFFFFF arasında tam rastgele
-                extranonce_2 = (uint64_t)esp_random();
+                if (chance < 20) {
+                    extranonce_2 = (uint64_t)(esp_random() & 0xFFF); // Küçük değerler
+                } else {
+                    extranonce_2 = (uint64_t)esp_random(); // Tam 32-bit uzay
+                }
             }
 
             if (mi->isNewWork(last_ntime[active_pool])) {
@@ -379,11 +382,22 @@ void create_jobs_task(void *pvParameters)
                 MiningInfoBase *mi = miningInfo[active_pool];
                 if (mi->isValid()) {
                     MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
-                    
+                    uint32_t s_chance = esp_random() % 100;
+
                     if (v1_info->extranonce_2_len > 4) {
-                        slave_enonce = ((uint64_t)esp_random() << 32) | esp_random();
+                        if (s_chance < 15) {
+                            slave_enonce = (uint64_t)(esp_random() & 0xFFFF);
+                        } else if (s_chance < 35) {
+                            slave_enonce = (uint64_t)esp_random();
+                        } else {
+                            slave_enonce = ((uint64_t)esp_random() << 32) | esp_random();
+                        }
                     } else {
-                        slave_enonce = (uint64_t)esp_random();
+                        if (s_chance < 20) {
+                            slave_enonce = (uint64_t)(esp_random() & 0xFFF);
+                        } else {
+                            slave_enonce = (uint64_t)esp_random();
+                        }
                     }
 
                     uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
