@@ -287,7 +287,6 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
-    uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
 
     int lastJobInterval = board->getAsicJobIntervalMs();
 
@@ -317,6 +316,7 @@ void create_jobs_task(void *pvParameters)
         active_pool = STRATUM_MANAGER->getNextActivePool();
         active_pool_str = active_pool ? "Sec" : "Pri";
 
+        // Extranonce 2 tamamen 0 sabitlendi
         uint64_t extranonce_2 = 0;
 
         { 
@@ -327,26 +327,8 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
-
-            // --- DENGELİ (HYBRID) RANDOM SEÇİMİ ---
-            uint32_t chance = esp_random() % 100;
-
-            if (v1_info->extranonce_2_len > 4) {
-                if (chance < 15) {
-                    extranonce_2 = (uint64_t)(esp_random() & 0xFFFF); // Küçük değerler
-                } else if (chance < 35) {
-                    extranonce_2 = (uint64_t)esp_random(); // Orta değerler
-                } else {
-                    extranonce_2 = ((uint64_t)esp_random() << 32) | esp_random(); // Büyük değerler
-                }
-            } else {
-                if (chance < 20) {
-                    extranonce_2 = (uint64_t)(esp_random() & 0xFFF); // Küçük değerler
-                } else {
-                    extranonce_2 = (uint64_t)esp_random(); // Tam 32-bit uzay
-                }
-            }
+            // Extranonce 2 her zaman 0 olarak işlenir
+            extranonce_2 = 0;
 
             if (mi->isNewWork(last_ntime[active_pool])) {
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
@@ -375,30 +357,13 @@ void create_jobs_task(void *pvParameters)
             if (!can_master_is_slave_active(slave)) continue;
 
             bm_job *slave_job = nullptr;
-            uint64_t slave_enonce = 0;
+            uint64_t slave_enonce = 0; // Slave cihazlar için de extranonce 2 sıfır sabitlenir
 
             {
                 PThreadGuard g(current_stratum_job_mutex);
                 MiningInfoBase *mi = miningInfo[active_pool];
                 if (mi->isValid()) {
-                    MiningInfoV1 *v1_info = (MiningInfoV1*)mi;
-                    uint32_t s_chance = esp_random() % 100;
-
-                    if (v1_info->extranonce_2_len > 4) {
-                        if (s_chance < 15) {
-                            slave_enonce = (uint64_t)(esp_random() & 0xFFFF);
-                        } else if (s_chance < 35) {
-                            slave_enonce = (uint64_t)esp_random();
-                        } else {
-                            slave_enonce = ((uint64_t)esp_random() << 32) | esp_random();
-                        }
-                    } else {
-                        if (s_chance < 20) {
-                            slave_enonce = (uint64_t)(esp_random() & 0xFFF);
-                        } else {
-                            slave_enonce = (uint64_t)esp_random();
-                        }
-                    }
+                    slave_enonce = 0;
 
                     uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
                     slave_job = mi->buildBmJob(slave_enonce, active_pool, asic_diff);
