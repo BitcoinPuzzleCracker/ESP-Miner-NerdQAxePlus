@@ -28,10 +28,21 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
-// MiningInfoBase - abstract interface for protocol-agnostic job construction
+// MiningInfoBase - abstract interface with getExtranonce2Len added to avoid RTTI
 // ============================================================================
 
-MiningInfoBase::~MiningInfoBase() {}
+class MiningInfoBase {
+  public:
+    virtual ~MiningInfoBase() {}
+    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
+    virtual bool isValid() const = 0;
+    virtual bool isNewWork(uint32_t &last_ntime) const = 0;
+    virtual const char* getJobId() const = 0;
+    virtual uint32_t getActiveDifficulty() const = 0;
+    virtual uint32_t getVersionMask() const = 0;
+    virtual void invalidate() = 0;
+    virtual int getExtranonce2Len() const = 0;
+};
 
 // ============================================================================
 // MiningInfoV1 - Stratum V1 job construction
@@ -126,6 +137,11 @@ class MiningInfoV1 : public MiningInfoBase {
     uint32_t getVersionMask() const override
     {
         return version_mask;
+    }
+
+    int getExtranonce2Len() const override
+    {
+        return extranonce_2_len;
     }
 
     void invalidate() override
@@ -335,8 +351,8 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
-            MiningInfoV1 *mi_v1 = dynamic_cast<MiningInfoV1*>(mi);
-            int e2_len = mi_v1 ? mi_v1->extranonce_2_len : 4;
+            // Direct via de virtuele interface (geen RTTI/dynamic_cast nodig)
+            int e2_len = mi->getExtranonce2Len();
 
             if (e2_len > 0 && e2_len <= 4) {
                 uint32_t mask = (e2_len == 4) ? 0xFFFFFFFF : ((1UL << (e2_len * 8)) - 1);
