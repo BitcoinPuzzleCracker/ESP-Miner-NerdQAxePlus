@@ -31,18 +31,7 @@ pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 // MiningInfoBase - abstract interface for protocol-agnostic job construction
 // ============================================================================
 
-class MiningInfoBase {
-  public:
-    virtual ~MiningInfoBase() {}
-    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
-    virtual bool isValid() const = 0;
-    virtual bool isNewWork(uint32_t &last_ntime) const = 0;
-    virtual const char* getJobId() const = 0;
-    virtual uint32_t getActiveDifficulty() const = 0;
-    virtual uint32_t getVersionMask() const = 0;
-    virtual void invalidate() = 0;
-    virtual int getExtranonce2Len() const = 0;
-};
+MiningInfoBase::~MiningInfoBase() {}
 
 // ============================================================================
 // MiningInfoV1 - Stratum V1 job construction
@@ -141,11 +130,6 @@ class MiningInfoV1 : public MiningInfoBase {
     uint32_t getVersionMask() const override
     {
         return version_mask;
-    }
-
-    int getExtranonce2Len() const override
-    {
-        return extranonce_2_len;
     }
 
     void invalidate() override
@@ -265,7 +249,7 @@ void set_next_enonce(int pool, char *enonce, int enonce2_len)
 
 void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
-    // NEGEER notify als abandonWork (clean) FALSE is, zodat we op de huidige job blijven doorrollen
+    // Negeer notify als clean/abandonWork false is, zodat we doorrollen op de huidige template
     if (!abandonWork) {
         ESP_LOGD(TAG, "(Pool %d) Ontvangen mining.notify genegeerd omdat clean=false is (doorrollen op huidige job).", pool);
         return;
@@ -358,8 +342,11 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
-            // Genereer Willekeurige (Random) Extranonce 2 binnen de lengte opgegeven door de pool
-            int e2_len = mi->getExtranonce2Len();
+            // Veilige check en cast naar MiningInfoV1 om extranonce_2_len uit te lezen
+            MiningInfoV1 *mi_v1 = dynamic_cast<MiningInfoV1*>(mi);
+            int e2_len = mi_v1 ? mi_v1->extranonce_2_len : 4;
+
+            // Genereer willekeurige extranonce_2 binnen het toegestane bereik
             if (e2_len > 0 && e2_len <= 4) {
                 uint32_t mask = (e2_len == 4) ? 0xFFFFFFFF : ((1UL << (e2_len * 8)) - 1);
                 extranonce_2 = esp_random() & mask;
@@ -389,7 +376,6 @@ void create_jobs_task(void *pvParameters)
         for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
             if (!can_master_is_slave_active(slave)) continue;
             
-            // Voor CAN slaves behouden we de rol of kunnen we ook randomizen indien gewenst
             uint32_t e2 = can_make_extranonce2(slave, slave_counters[slave]++);
 
             bm_job *slave_job = nullptr;
