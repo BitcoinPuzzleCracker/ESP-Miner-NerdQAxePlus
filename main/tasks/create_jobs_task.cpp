@@ -73,24 +73,20 @@ class MiningInfoV1 : public MiningInfoBase {
 
     bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
-        // generate extranonce2 hex string
-        char extranonce_2_str[extranonce_2_len * 2 + 1]; // +1 zero termination
+        char extranonce_2_str[extranonce_2_len * 2 + 1];
         snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%0*lx", (int) extranonce_2_len * 2, (unsigned long) extranonce_2);
 
-        // generate coinbase tx
         int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) + strlen(extranonce_2_str) +
                               strlen(current_job->coinbase_2);
         char *coinbase_tx = (char *) MALLOC(coinbase_tx_len + 1);
         snprintf(coinbase_tx, coinbase_tx_len + 1, "%s%s%s%s", current_job->coinbase_1, extranonce_str,
                  extranonce_2_str, current_job->coinbase_2);
 
-        // calculate merkle root
         char merkle_root[65];
         calculate_merkle_root_hash(coinbase_tx, current_job->_merkle_branches, current_job->n_merkle_branches,
                                    merkle_root);
         free(coinbase_tx);
 
-        // we need malloc because we will save it in the job array
         bm_job *next_job = (bm_job *) MALLOC(sizeof(bm_job));
         construct_bm_job(current_job, merkle_root, version_mask, next_job);
         next_job->jobid = strdup(current_job->job_id);
@@ -193,7 +189,6 @@ class MiningInfoV1 : public MiningInfoBase {
     }
 };
 
-// Global mining info instances - one per pool slot
 static MiningInfoV1 s_miningInfoV1[2] = {MiningInfoV1{}, MiningInfoV1{}};
 MiningInfoBase* miningInfo[2] = {&s_miningInfoV1[0], &s_miningInfoV1[1]};
 
@@ -251,7 +246,7 @@ void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
     // Negeer notify als clean/abandonWork false is, zodat we doorrollen op de huidige template
     if (!abandonWork) {
-        ESP_LOGD(TAG, "(Pool %d) Ontvangen mining.notify genegeerd omdat clean=false is (doorrollen op huidige job).", pool);
+        ESP_LOGD(TAG, "(Pool %d) Ontvangen mining.notify genegeerd omdat clean=false is.", pool);
         return;
     }
 
@@ -295,8 +290,6 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
-
-    // CAN: per-slave rolling counters
     uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
 
     int lastJobInterval = board->getAsicJobIntervalMs();
@@ -342,11 +335,9 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
-            // Veilige check en cast naar MiningInfoV1 om extranonce_2_len uit te lezen
             MiningInfoV1 *mi_v1 = dynamic_cast<MiningInfoV1*>(mi);
             int e2_len = mi_v1 ? mi_v1->extranonce_2_len : 4;
 
-            // Genereer willekeurige extranonce_2 binnen het toegestane bereik
             if (e2_len > 0 && e2_len <= 4) {
                 uint32_t mask = (e2_len == 4) ? 0xFFFFFFFF : ((1UL << (e2_len * 8)) - 1);
                 extranonce_2 = esp_random() & mask;
@@ -372,7 +363,6 @@ void create_jobs_task(void *pvParameters)
 
         asicJobs.storeJob(next_job, asic_job_id);
 
-        // --- CAN: send raw job to each slave ---
         for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
             if (!can_master_is_slave_active(slave)) continue;
             
