@@ -31,7 +31,18 @@ pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 // MiningInfoBase - abstract interface for protocol-agnostic job construction
 // ============================================================================
 
-MiningInfoBase::~MiningInfoBase() {}
+class MiningInfoBase {
+  public:
+    virtual ~MiningInfoBase() {}
+    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
+    virtual bool isValid() const = 0;
+    virtual bool isNewWork(uint32_t &last_ntime) const = 0;
+    virtual const char* getJobId() const = 0;
+    virtual uint32_t getActiveDifficulty() const = 0;
+    virtual uint32_t getVersionMask() const = 0;
+    virtual void invalidate() = 0;
+    virtual int getExtranonce2Len() const = 0;
+};
 
 // ============================================================================
 // MiningInfoV1 - Stratum V1 job construction
@@ -104,9 +115,6 @@ class MiningInfoV1 : public MiningInfoBase {
 
     bool isValid() const override
     {
-        // a job needs both the notify and the extranonce1 from the subscribe result.
-        // After invalidate() a mining.notify can arrive without a usable subscribe
-        // result (e.g. malformed response), which would crash buildBmJob().
         return current_job->ntime != 0 && extranonce_str && current_job->job_id && current_job->coinbase_1 &&
                current_job->coinbase_2;
     }
@@ -135,9 +143,13 @@ class MiningInfoV1 : public MiningInfoBase {
         return version_mask;
     }
 
+    int getExtranonce2Len() const override
+    {
+        return extranonce_2_len;
+    }
+
     void invalidate() override
     {
-        // mark as invalid
         current_job->ntime = 0;
         safe_free(extranonce_str);
         safe_free(next_extranonce_str);
@@ -155,10 +167,7 @@ class MiningInfoV1 : public MiningInfoBase {
 
     bool set_difficulty(uint32_t difficulty)
     {
-        // new difficulty?
         bool is_new = stratum_difficulty != difficulty;
-
-        // set difficulty
         stratum_difficulty = difficulty;
         return is_new;
     }
@@ -166,7 +175,6 @@ class MiningInfoV1 : public MiningInfoBase {
     void set_enonce(char *enonce, int enonce2_len)
     {
         safe_free(extranonce_str);
-
         extranonce_str = strdup(enonce);
         extranonce_2_len = enonce2_len;
     }
@@ -174,14 +182,12 @@ class MiningInfoV1 : public MiningInfoBase {
     void set_next_enonce(char *enonce, int enonce2_len)
     {
         safe_free(next_extranonce_str);
-
         next_extranonce_str = strdup(enonce);
         next_extranonce_2_len = enonce2_len;
     }
 
     void create_job_mining_notify(mining_notify *notify)
     {
-        // do we have a pending extranonce switch?
         if (next_extranonce_str) {
             safe_free(extranonce_str);
             extranonce_str = strdup(next_extranonce_str);
@@ -194,14 +200,11 @@ class MiningInfoV1 : public MiningInfoBase {
         safe_free(current_job->coinbase_1);
         safe_free(current_job->coinbase_2);
 
-        // copy trivial types
         memcpy(current_job, notify, sizeof(mining_notify));
-        // duplicate dynamic strings with unknown length
         current_job->job_id = strdup(notify->job_id);
         current_job->coinbase_1 = strdup(notify->coinbase_1);
         current_job->coinbase_2 = strdup(notify->coinbase_2);
 
-        // set active difficulty with the mining.notify command
         active_stratum_difficulty = stratum_difficulty;
     }
 };
@@ -227,14 +230,9 @@ void trigger_job_creation()
     pthread_mutex_unlock(&job_mutex);
 }
 
-// Ensure miningInfo[pool] points to the V1 instance.
-// Called by all V1 free functions to handle mixed-protocol fallback
-// (e.g., pool was SV2 and switched to V1 - miningInfo might still
-// point to a V2 instance from create_jobs_sv2.cpp).
 static MiningInfoV1* ensureV1(int pool)
 {
     if (miningInfo[pool] != &s_miningInfoV1[pool]) {
-        // Reset to V1 instance (V2 instances are owned by create_jobs_sv2.cpp)
         s_miningInfoV1[pool].invalidate();
         miningInfo[pool] = &s_miningInfoV1[pool];
     }
@@ -267,9 +265,14 @@ void set_next_enonce(int pool, char *enonce, int enonce2_len)
 
 void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
+    // NEGEER notify als abandonWork (clean) FALSE is, zodat we op de huidige job blijven doorrollen
+    if (!abandonWork) {
+        ESP_LOGD(TAG, "(Pool %d) Ontvangen mining.notify genegeerd omdat clean=false is (doorrollen op huidige job).", pool);
+        return;
+    }
+
     {
         PThreadGuard g(current_stratum_job_mutex);
-        // clear jobs for pool
         if (abandonWork) {
             asicJobs.cleanJobs(pool);
         }
@@ -294,7 +297,6 @@ void create_jobs_task(void *pvParameters)
     SYSTEM_MODULE.notifyMiningStarted();
     ESP_LOGI(TAG, "ASIC Ready!");
 
-    // Create the timer
     TimerHandle_t job_timer = xTimerCreate(TAG, pdMS_TO_TICKS(board->getAsicJobIntervalMs()), pdTRUE, NULL, create_job_timer);
 
     if (job_timer == NULL) {
@@ -302,7 +304,6 @@ void create_jobs_task(void *pvParameters)
         return;
     }
 
-    // Start the timer
     if (xTimerStart(job_timer, 0) != pdPASS) {
         ESP_LOGE(TAG, "Failed to start timer");
         return;
@@ -310,9 +311,8 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
-    uint32_t extranonce_2 = 0;
 
-    // CAN: per-slave rolling counters (upper 7 bits = slave_id, lower 25 = counter)
+    // CAN: per-slave rolling counters
     uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
 
     int lastJobInterval = board->getAsicJobIntervalMs();
@@ -323,10 +323,9 @@ void create_jobs_task(void *pvParameters)
             vTaskSuspend(NULL);
         }
         pthread_mutex_lock(&job_mutex);
-        pthread_cond_wait(&job_cond, &job_mutex); // Wait for the timer or external trigger
+        pthread_cond_wait(&job_cond, &job_mutex);
         pthread_mutex_unlock(&job_mutex);
 
-        // job interval changed via UI
         if (board->getAsicJobIntervalMs() != lastJobInterval) {
             xTimerChangePeriod(job_timer, pdMS_TO_TICKS(board->getAsicJobIntervalMs()), 0);
             lastJobInterval = board->getAsicJobIntervalMs();
@@ -341,14 +340,14 @@ void create_jobs_task(void *pvParameters)
             continue;
         }
 
-        // select pool to mine for
         active_pool = STRATUM_MANAGER->getNextActivePool();
         active_pool_str = active_pool ? "Sec" : "Pri";
 
-        { // scope for mutex
+        uint32_t extranonce_2 = 0;
+
+        { 
             PThreadGuard g(current_stratum_job_mutex);
 
-            // set current pool data
             MiningInfoBase *mi = miningInfo[active_pool];
 
             if (!mi->isValid() || !asics) {
@@ -359,11 +358,19 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
+            // Genereer Willekeurige (Random) Extranonce 2 binnen de lengte opgegeven door de pool
+            int e2_len = mi->getExtranonce2Len();
+            if (e2_len > 0 && e2_len <= 4) {
+                uint32_t mask = (e2_len == 4) ? 0xFFFFFFFF : ((1UL << (e2_len * 8)) - 1);
+                extranonce_2 = esp_random() & mask;
+            } else {
+                extranonce_2 = esp_random();
+            }
+
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
             next_job = mi->buildBmJob(extranonce_2, active_pool, asic_diff);
-        } // mutex
+        }
 
-        // set asic difficulty
         asics->setJobDifficultyMask(next_job->asic_diff);
 
         uint64_t current_time = esp_timer_get_time();
@@ -376,14 +383,13 @@ void create_jobs_task(void *pvParameters)
 
         ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X", active_pool_str, active_pool, asic_job_id);
 
-        // save job
         asicJobs.storeJob(next_job, asic_job_id);
-
-        extranonce_2++;
 
         // --- CAN: send raw job to each slave ---
         for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
             if (!can_master_is_slave_active(slave)) continue;
+            
+            // Voor CAN slaves behouden we de rol of kunnen we ook randomizen indien gewenst
             uint32_t e2 = can_make_extranonce2(slave, slave_counters[slave]++);
 
             bm_job *slave_job = nullptr;
@@ -399,10 +405,7 @@ void create_jobs_task(void *pvParameters)
             if (slave_job) {
                 can_send_raw_job(slave, (uint8_t) asic_job_id, slave_job);
                 slaveAsicJobs[slave].storeJob(slave_job, asic_job_id);
-                // slaveAsicJobs owns slave_job now — do not free here
             }
         }
-
     }
-
 }
