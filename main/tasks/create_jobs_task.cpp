@@ -28,7 +28,7 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
-// MiningInfoV1 - Stratum V1 job construction (Original layout)
+// MiningInfoV1 - Stratum V1 job construction
 // ============================================================================
 
 class MiningInfoV1 : public MiningInfoBase {
@@ -238,7 +238,7 @@ void set_next_enonce(int pool, char *enonce, int enonce2_len)
 
 void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
-    // HIER GEBRUIKEN WE JOUW WENS: Negeer notify als clean/abandonWork false is, zodat we doorrollen
+    // Negeer notify als clean/abandonWork false is, zodat we doorrollen op de huidige template
     if (!abandonWork) {
         ESP_LOGD(TAG, "(Pool %d) Ontvangen mining.notify genegeerd omdat clean=false is.", pool);
         return;
@@ -329,10 +329,8 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
-            // Haal extranonce_2_len veilig op via de V1 instantie zonder RTTI/dynamic_cast
             int e2_len = s_miningInfoV1[active_pool].extranonce_2_len;
 
-            // HIER GEBRUIKEN WE JOUW WENS: Willekeurige (Random) Extranonce 2 binnen het bereik
             if (e2_len > 0 && e2_len <= 4) {
                 uint32_t mask = (e2_len == 4) ? 0xFFFFFFFF : ((1UL << (e2_len * 8)) - 1);
                 extranonce_2 = esp_random() & mask;
