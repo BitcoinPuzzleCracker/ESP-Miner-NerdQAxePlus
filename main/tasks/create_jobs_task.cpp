@@ -28,24 +28,7 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
-// MiningInfoBase - abstract interface with getExtranonce2Len added to avoid RTTI
-// ============================================================================
-
-class MiningInfoBase {
-  public:
-    virtual ~MiningInfoBase() {}
-    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
-    virtual bool isValid() const = 0;
-    virtual bool isNewWork(uint32_t &last_ntime) const = 0;
-    virtual const char* getJobId() const = 0;
-    virtual uint32_t getActiveDifficulty() const = 0;
-    virtual uint32_t getVersionMask() const = 0;
-    virtual void invalidate() = 0;
-    virtual int getExtranonce2Len() const = 0;
-};
-
-// ============================================================================
-// MiningInfoV1 - Stratum V1 job construction
+// MiningInfoV1 - Stratum V1 job construction (Original layout)
 // ============================================================================
 
 class MiningInfoV1 : public MiningInfoBase {
@@ -137,11 +120,6 @@ class MiningInfoV1 : public MiningInfoBase {
     uint32_t getVersionMask() const override
     {
         return version_mask;
-    }
-
-    int getExtranonce2Len() const override
-    {
-        return extranonce_2_len;
     }
 
     void invalidate() override
@@ -260,7 +238,7 @@ void set_next_enonce(int pool, char *enonce, int enonce2_len)
 
 void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
-    // Negeer notify als clean/abandonWork false is, zodat we doorrollen op de huidige template
+    // HIER GEBRUIKEN WE JOUW WENS: Negeer notify als clean/abandonWork false is, zodat we doorrollen
     if (!abandonWork) {
         ESP_LOGD(TAG, "(Pool %d) Ontvangen mining.notify genegeerd omdat clean=false is.", pool);
         return;
@@ -351,9 +329,10 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
-            // Direct via de virtuele interface (geen RTTI/dynamic_cast nodig)
-            int e2_len = mi->getExtranonce2Len();
+            // Haal extranonce_2_len veilig op via de V1 instantie zonder RTTI/dynamic_cast
+            int e2_len = s_miningInfoV1[active_pool].extranonce_2_len;
 
+            // HIER GEBRUIKEN WE JOUW WENS: Willekeurige (Random) Extranonce 2 binnen het bereik
             if (e2_len > 0 && e2_len <= 4) {
                 uint32_t mask = (e2_len == 4) ? 0xFFFFFFFF : ((1UL << (e2_len * 8)) - 1);
                 extranonce_2 = esp_random() & mask;
