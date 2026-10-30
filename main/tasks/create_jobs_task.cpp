@@ -94,7 +94,7 @@ void on_asic_result_found(const char *job_id_from_share, uint32_t found_nonce, u
         return; // Verstuur NIET naar de pool om "Job not found" (rejected) te voorkomen
     }
 
-    // Als de Job ID exact overeenkomt, stuur veilig de mining.submit
+    // Als de Job ID exact overeenkomt, stuur veilig de mining.submit met gecaste rolled_version
     // stratum_send_submit(active_id, found_nonce, rolled_version);
-    ESP_LOGI(TAG, "Geldige share verzonden! Job: %s, Ver: %08X", active_id, rolled_version);
+    ESP_LOGI(TAG, "Geldige share verzonden! Job: %s, Ver: %08X", active_id, (unsigned int)rolled_version);
 }
