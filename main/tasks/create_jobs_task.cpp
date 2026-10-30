@@ -27,6 +27,9 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Los op dat de linker de destructor van MiningInfoBase kan vinden
+MiningInfoBase::~MiningInfoBase() {}
+
 // ============================================================================
 // MiningInfoV1 - Stratum V1 job construction
 // ============================================================================
@@ -238,7 +241,6 @@ void set_next_enonce(int pool, char *enonce, int enonce2_len)
 
 void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
-    // Negeer notify als clean/abandonWork false is, zodat we doorrollen op de huidige template
     if (!abandonWork) {
         ESP_LOGD(TAG, "(Pool %d) Ontvangen mining.notify genegeerd omdat clean=false is.", pool);
         return;
