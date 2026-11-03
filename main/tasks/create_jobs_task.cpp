@@ -6,6 +6,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
+#include "esp_random.h"
 #include "mining.h"
 
 #include "global_state.h"
@@ -16,8 +17,6 @@
 #include "boards/board.h"
 #include "macros.h"
 #include "system.h"
-
-#include "extranonce2.h"
 
 #define PRIMARY 0
 #define SECONDARY 1
@@ -30,13 +29,120 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
-// MiningInfoBase - abstract interface for protocol-agnostic job construction
+// INLINE EXTRANONCE2 GENERATOR
+// Random-permutation met expliciete testvectoren. Alles in dit bestand.
+// ============================================================================
+
+#define EXTRANONCE2_MAX_BYTES 8
+#define EXTRANONCE2_NUM_POOLS 2
+
+#ifndef CAN_SLAVE_MAX
+#define CAN_SLAVE_MAX 8
+#endif
+
+static const uint64_t E2_TEST_VECTORS[] = {
+    0x0000000000000001ULL,
+    0x0000000000000002ULL,
+    0x0000000000000022ULL,
+    0x00000000000000FFULL,
+    0x0000000000000100ULL,
+    0x000000000000FFFFULL,
+    0x0000000000010000ULL,
+    0x00000000FFFFFFFFULL,
+    0x0000000100000000ULL,
+    0x0000000100000001ULL,
+    0x0123456789ABCDEFULL,
+    0x7FFFFFFFFFFFFFFFULL,
+    0x8000000000000000ULL,
+    0xFFFFFFFFFFFFFF00ULL,
+    0xFFFFFFFFFFFFFFFEULL,
+    0xFFFFFFFFFFFFFFFFULL,
+};
+#define E2_NUM_TEST_VECTORS (sizeof(E2_TEST_VECTORS) / sizeof(E2_TEST_VECTORS[0]))
+
+typedef struct {
+    uint64_t counter;
+    uint64_t seed;
+    size_t   tv_idx;
+    bool     use_tv;
+    bool     initialized;
+} e2_state_t;
+
+static e2_state_t     s_e2_pool[EXTRANONCE2_NUM_POOLS];
+static e2_state_t     s_e2_slave[CAN_SLAVE_MAX];
+static pthread_mutex_t s_e2_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint64_t e2_splitmix64(uint64_t x)
+{
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
+}
+
+static inline uint64_t e2_random_u64(void)
+{
+    return ((uint64_t) esp_random() << 32) | esp_random();
+}
+
+static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits)
+{
+    if (len_bytes <= 0) len_bytes = EXTRANONCE2_MAX_BYTES;
+    if (len_bytes > EXTRANONCE2_MAX_BYTES) len_bytes = EXTRANONCE2_MAX_BYTES;
+
+    int bits = len_bytes * 8;
+    uint64_t mask = (bits >= 64) ? ~0ULL : ((1ULL << bits) - 1);
+
+    if (!st->initialized) {
+        st->seed        = e2_random_u64();
+        st->counter     = st->seed;
+        st->tv_idx      = 0;
+        st->use_tv      = true;
+        st->initialized = true;
+        ESP_LOGI(TAG, "e2 seed=%016llx len=%d",
+                 (unsigned long long) st->seed, len_bytes);
+    }
+
+    uint64_t v;
+    if (st->use_tv) {
+        v = E2_TEST_VECTORS[st->tv_idx++];
+        if (st->tv_idx >= E2_NUM_TEST_VECTORS) st->use_tv = false;
+    } else {
+        v = e2_splitmix64(st->counter++);
+    }
+
+    v &= mask;
+    v = (v & ~high_bits) | (high_bits & mask);
+    return v;
+}
+
+static uint64_t e2_next_pool(int pool, int len_bytes)
+{
+    if (pool < 0 || pool >= EXTRANONCE2_NUM_POOLS) pool = 0;
+    pthread_mutex_lock(&s_e2_lock);
+    uint64_t v = e2_state_next(&s_e2_pool[pool], len_bytes, 0);
+    pthread_mutex_unlock(&s_e2_lock);
+    return v;
+}
+
+static uint64_t e2_next_slave(uint8_t slave_id, int len_bytes)
+{
+    if (slave_id >= CAN_SLAVE_MAX) return 0;
+    uint64_t high_bits = ((uint64_t) slave_id) << 56;
+    pthread_mutex_lock(&s_e2_lock);
+    uint64_t v = e2_state_next(&s_e2_slave[slave_id], len_bytes, high_bits);
+    pthread_mutex_unlock(&s_e2_lock);
+    return v;
+}
+
+// ============================================================================
+// MiningInfoBase
 // ============================================================================
 
 MiningInfoBase::~MiningInfoBase() {}
 
 // ============================================================================
-// MiningInfoV1 - Stratum V1 job construction
+// MiningInfoV1
 // ============================================================================
 
 class MiningInfoV1 : public MiningInfoBase {
@@ -70,8 +176,6 @@ class MiningInfoV1 : public MiningInfoBase {
             free(current_job);
         }
     }
-
-    // --- MiningInfoBase interface ---
 
     bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
@@ -118,20 +222,9 @@ class MiningInfoV1 : public MiningInfoBase {
         return false;
     }
 
-    const char* getJobId() const override
-    {
-        return current_job->job_id;
-    }
-
-    uint32_t getActiveDifficulty() const override
-    {
-        return active_stratum_difficulty;
-    }
-
-    uint32_t getVersionMask() const override
-    {
-        return version_mask;
-    }
+    const char* getJobId() const override { return current_job->job_id; }
+    uint32_t getActiveDifficulty() const override { return active_stratum_difficulty; }
+    uint32_t getVersionMask() const override { return version_mask; }
 
     void invalidate() override
     {
@@ -143,12 +236,7 @@ class MiningInfoV1 : public MiningInfoBase {
         safe_free(current_job->coinbase_2);
     }
 
-    // --- V1-specific methods ---
-
-    void set_version_mask(uint32_t mask)
-    {
-        version_mask = mask;
-    }
+    void set_version_mask(uint32_t mask) { version_mask = mask; }
 
     bool set_difficulty(uint32_t difficulty)
     {
@@ -186,7 +274,7 @@ class MiningInfoV1 : public MiningInfoBase {
         safe_free(current_job->coinbase_2);
 
         memcpy(current_job, notify, sizeof(mining_notify));
-        current_job->job_id = strdup(notify->job_id);
+        current_job->job_id    = strdup(notify->job_id);
         current_job->coinbase_1 = strdup(notify->coinbase_1);
         current_job->coinbase_2 = strdup(notify->coinbase_2);
 
@@ -194,7 +282,6 @@ class MiningInfoV1 : public MiningInfoBase {
     }
 };
 
-// Global mining info instances - one per pool slot
 static MiningInfoV1 s_miningInfoV1[2] = {MiningInfoV1{}, MiningInfoV1{}};
 MiningInfoBase* miningInfo[2] = {&s_miningInfoV1[0], &s_miningInfoV1[1]};
 
@@ -321,7 +408,6 @@ void create_jobs_task(void *pvParameters)
         active_pool = STRATUM_MANAGER->getNextActivePool();
         active_pool_str = active_pool ? "Sec" : "Pri";
 
-        // Lengte van extranonce2 voor deze pool
         int e2_len;
         {
             PThreadGuard g(current_stratum_job_mutex);
@@ -343,8 +429,8 @@ void create_jobs_task(void *pvParameters)
                          active_pool_str, mi->getJobId());
             }
 
-            // Random-permutation extranonce2 (testvectoren eerst, dan random)
-            uint64_t e2 = extranonce2_next(active_pool, e2_len);
+            // Random-permutation extranonce2
+            uint64_t e2 = e2_next_pool(active_pool, e2_len);
 
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(
                                      active_pool, mi->getActiveDifficulty());
@@ -365,7 +451,6 @@ void create_jobs_task(void *pvParameters)
         }
         last_submit_time = current_time;
 
-        // sendWork verwacht een 32-bit ID; we geven de low 32 bits van e2 door
         int asic_job_id = asics->sendWork(0, next_job);
 
         ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X",
@@ -373,11 +458,11 @@ void create_jobs_task(void *pvParameters)
 
         asicJobs.storeJob(next_job, asic_job_id);
 
-        // --- CAN: per-slave random-permutation extranonce2 ---
+        // --- CAN slaves ---
         for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
             if (!can_master_is_slave_active(slave)) continue;
 
-            uint64_t e2 = extranonce2_next_slave(slave, e2_len);
+            uint64_t e2 = e2_next_slave(slave, e2_len);
 
             bm_job *slave_job = nullptr;
             {
