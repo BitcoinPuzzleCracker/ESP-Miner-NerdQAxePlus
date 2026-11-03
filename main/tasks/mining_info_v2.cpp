@@ -44,7 +44,7 @@ void MiningInfoV2Standard::updateJob(uint32_t job_id, uint32_t version,
     snprintf(m_jobid_str, sizeof(m_jobid_str), "%lu", (unsigned long)job_id);
 }
 
-bm_job *MiningInfoV2Standard::buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff)
+bm_job *MiningInfoV2Standard::buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff)
 {
     bm_job *job = (bm_job *)malloc(sizeof(bm_job));
     if (!job) return nullptr;
@@ -212,7 +212,7 @@ void MiningInfoV2Extended::updateJob(const sv2_ext_job_t *ext_job,
     }
 }
 
-bm_job *MiningInfoV2Extended::buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff)
+bm_job *MiningInfoV2Extended::buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff)
 {
     bm_job *job = (bm_job *)malloc(sizeof(bm_job));
     if (!job) return nullptr;
@@ -220,7 +220,7 @@ bm_job *MiningInfoV2Extended::buildBmJob(uint32_t extranonce_2, int pool_id, uin
     // Derive extranonce_2 binary from counter (big-endian)
     uint8_t en2_bin[32];
     memset(en2_bin, 0, sizeof(en2_bin));
-    uint32_t counter = extranonce_2;
+    uint64_t counter = extranonce_2;
     for (int i = m_extranonce_size - 1; i >= 0 && counter > 0; i--) {
         en2_bin[i] = (uint8_t)(counter & 0xFF);
         counter >>= 8;
