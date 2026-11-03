@@ -429,7 +429,6 @@ void create_jobs_task(void *pvParameters)
                          active_pool_str, mi->getJobId());
             }
 
-            // Random-permutation extranonce2
             uint64_t e2 = e2_next_pool(active_pool, e2_len);
 
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(
