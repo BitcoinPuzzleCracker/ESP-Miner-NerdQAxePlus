@@ -29,23 +29,30 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
-// INLINE EXTRANONCE2 GENERATOR
-// Random-permutation met expliciete testvectoren. Alles in dit bestand.
+// INLINE EXTRANONCE2 GENERATOR — cyclisch klein → groot → klein → ...
 // ============================================================================
 
 #define EXTRANONCE2_MAX_BYTES 8
 #define EXTRANONCE2_NUM_POOLS 2
+#define E2_JOBS_PER_PHASE     20
 
 #ifndef CAN_SLAVE_MAX
 #define CAN_SLAVE_MAX 8
 #endif
 
+// Expliciete testvectoren — worden 1x afgelopen bij de start
 static const uint64_t E2_TEST_VECTORS[] = {
     0x0000000000000001ULL,
     0x0000000000000002ULL,
+    0x0000000000000003ULL,
+    0x0000000000000004ULL,
+    0x0000000000000010ULL,
+    0x0000000000000020ULL,
     0x0000000000000022ULL,
+    0x0000000000000064ULL,
     0x00000000000000FFULL,
     0x0000000000000100ULL,
+    0x0000000000000FFFULL,
     0x000000000000FFFFULL,
     0x0000000000010000ULL,
     0x00000000FFFFFFFFULL,
@@ -60,16 +67,42 @@ static const uint64_t E2_TEST_VECTORS[] = {
 };
 #define E2_NUM_TEST_VECTORS (sizeof(E2_TEST_VECTORS) / sizeof(E2_TEST_VECTORS[0]))
 
+typedef enum {
+    E2_PHASE_TEST_VECTORS = 0,
+    E2_PHASE_RANDOM_8BIT,
+    E2_PHASE_RANDOM_16BIT,
+    E2_PHASE_RANDOM_24BIT,
+    E2_PHASE_RANDOM_32BIT,
+    E2_PHASE_RANDOM_48BIT,
+    E2_PHASE_FULL_PERMUTATION,
+    E2_PHASE_COUNT
+} e2_phase_t;
+
+static const char* e2_phase_name(e2_phase_t p)
+{
+    switch (p) {
+        case E2_PHASE_TEST_VECTORS:     return "TEST_VECTORS";
+        case E2_PHASE_RANDOM_8BIT:      return "RANDOM_8BIT";
+        case E2_PHASE_RANDOM_16BIT:     return "RANDOM_16BIT";
+        case E2_PHASE_RANDOM_24BIT:     return "RANDOM_24BIT";
+        case E2_PHASE_RANDOM_32BIT:     return "RANDOM_32BIT";
+        case E2_PHASE_RANDOM_48BIT:     return "RANDOM_48BIT";
+        case E2_PHASE_FULL_PERMUTATION: return "RANDOM_64BIT";
+        default:                         return "UNKNOWN";
+    }
+}
+
 typedef struct {
-    uint64_t counter;
-    uint64_t seed;
-    size_t   tv_idx;
-    bool     use_tv;
-    bool     initialized;
+    uint64_t   counter;
+    uint64_t   seed;
+    size_t     tv_idx;
+    e2_phase_t phase;
+    uint32_t   phase_remaining;
+    bool       initialized;
 } e2_state_t;
 
-static e2_state_t     s_e2_pool[EXTRANONCE2_NUM_POOLS];
-static e2_state_t     s_e2_slave[CAN_SLAVE_MAX];
+static e2_state_t      s_e2_pool[EXTRANONCE2_NUM_POOLS];
+static e2_state_t      s_e2_slave[CAN_SLAVE_MAX];
 static pthread_mutex_t s_e2_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static inline uint64_t e2_splitmix64(uint64_t x)
@@ -85,7 +118,36 @@ static inline uint64_t e2_random_u64(void)
     return ((uint64_t) esp_random() << 32) | esp_random();
 }
 
-static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits)
+// Geeft het aantal bits voor de huidige fase
+static int e2_phase_bits(e2_phase_t p)
+{
+    switch (p) {
+        case E2_PHASE_RANDOM_8BIT:      return 8;
+        case E2_PHASE_RANDOM_16BIT:     return 16;
+        case E2_PHASE_RANDOM_24BIT:     return 24;
+        case E2_PHASE_RANDOM_32BIT:     return 32;
+        case E2_PHASE_RANDOM_48BIT:     return 48;
+        case E2_PHASE_FULL_PERMUTATION: return 64;
+        default:                         return 64;
+    }
+}
+
+// Volgende fase — cyclisch. Na FULL_PERMUTATION terug naar RANDOM_8BIT.
+static e2_phase_t e2_phase_next(e2_phase_t p)
+{
+    switch (p) {
+        case E2_PHASE_TEST_VECTORS:     return E2_PHASE_RANDOM_8BIT;
+        case E2_PHASE_RANDOM_8BIT:      return E2_PHASE_RANDOM_16BIT;
+        case E2_PHASE_RANDOM_16BIT:     return E2_PHASE_RANDOM_24BIT;
+        case E2_PHASE_RANDOM_24BIT:     return E2_PHASE_RANDOM_32BIT;
+        case E2_PHASE_RANDOM_32BIT:     return E2_PHASE_RANDOM_48BIT;
+        case E2_PHASE_RANDOM_48BIT:     return E2_PHASE_FULL_PERMUTATION;
+        case E2_PHASE_FULL_PERMUTATION: return E2_PHASE_RANDOM_8BIT;   // ← loop!
+        default:                         return E2_PHASE_RANDOM_8BIT;
+    }
+}
+
+static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits, const char *name)
 {
     if (len_bytes <= 0) len_bytes = EXTRANONCE2_MAX_BYTES;
     if (len_bytes > EXTRANONCE2_MAX_BYTES) len_bytes = EXTRANONCE2_MAX_BYTES;
@@ -94,21 +156,42 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits)
     uint64_t mask = (bits >= 64) ? ~0ULL : ((1ULL << bits) - 1);
 
     if (!st->initialized) {
-        st->seed        = e2_random_u64();
-        st->counter     = st->seed;
-        st->tv_idx      = 0;
-        st->use_tv      = true;
-        st->initialized = true;
-        ESP_LOGI(TAG, "e2 seed=%016llx len=%d",
-                 (unsigned long long) st->seed, len_bytes);
+        st->seed            = e2_random_u64();
+        st->counter         = st->seed;
+        st->tv_idx          = 0;
+        st->phase           = E2_PHASE_TEST_VECTORS;
+        st->phase_remaining = E2_JOBS_PER_PHASE;
+        st->initialized     = true;
+        ESP_LOGI(TAG, "[%s] e2 seed=%016llx len=%d phase=%s",
+                 name, (unsigned long long) st->seed, len_bytes,
+                 e2_phase_name(st->phase));
     }
 
     uint64_t v;
-    if (st->use_tv) {
+
+    if (st->phase == E2_PHASE_TEST_VECTORS) {
         v = E2_TEST_VECTORS[st->tv_idx++];
-        if (st->tv_idx >= E2_NUM_TEST_VECTORS) st->use_tv = false;
+        if (st->tv_idx >= E2_NUM_TEST_VECTORS) {
+            st->phase = e2_phase_next(st->phase);
+            st->phase_remaining = E2_JOBS_PER_PHASE;
+            ESP_LOGI(TAG, "[%s] e2 phase -> %s (x%u)",
+                     name, e2_phase_name(st->phase), E2_JOBS_PER_PHASE);
+        }
     } else {
         v = e2_splitmix64(st->counter++);
+
+        int phase_bits = e2_phase_bits(st->phase);
+        if (phase_bits > bits) phase_bits = bits;   // clamp op len_bytes
+        if (phase_bits < 64) {
+            v &= ((1ULL << phase_bits) - 1);
+        }
+
+        if (--st->phase_remaining == 0) {
+            st->phase = e2_phase_next(st->phase);   // cyclisch
+            st->phase_remaining = E2_JOBS_PER_PHASE;
+            ESP_LOGI(TAG, "[%s] e2 phase -> %s (x%u)",
+                     name, e2_phase_name(st->phase), E2_JOBS_PER_PHASE);
+        }
     }
 
     v &= mask;
@@ -120,7 +203,7 @@ static uint64_t e2_next_pool(int pool, int len_bytes)
 {
     if (pool < 0 || pool >= EXTRANONCE2_NUM_POOLS) pool = 0;
     pthread_mutex_lock(&s_e2_lock);
-    uint64_t v = e2_state_next(&s_e2_pool[pool], len_bytes, 0);
+    uint64_t v = e2_state_next(&s_e2_pool[pool], len_bytes, 0, pool ? "Sec" : "Pri");
     pthread_mutex_unlock(&s_e2_lock);
     return v;
 }
@@ -129,8 +212,10 @@ static uint64_t e2_next_slave(uint8_t slave_id, int len_bytes)
 {
     if (slave_id >= CAN_SLAVE_MAX) return 0;
     uint64_t high_bits = ((uint64_t) slave_id) << 56;
+    char name[8];
+    snprintf(name, sizeof(name), "S%u", slave_id);
     pthread_mutex_lock(&s_e2_lock);
-    uint64_t v = e2_state_next(&s_e2_slave[slave_id], len_bytes, high_bits);
+    uint64_t v = e2_state_next(&s_e2_slave[slave_id], len_bytes, high_bits, name);
     pthread_mutex_unlock(&s_e2_lock);
     return v;
 }
