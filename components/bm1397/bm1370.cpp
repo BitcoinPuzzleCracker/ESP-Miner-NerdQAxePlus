@@ -66,12 +66,8 @@ uint8_t BM1370::init(uint64_t frequency, uint16_t asic_count, uint32_t difficult
     send6(CMD_WRITE_ALL, 0x00, 0xA8, 0x00, 0x07, 0x00, 0x00);
 
     // Misc Control
-    // [TEST] Version rolling window: breed i.p.v. smal
-    // Origineel was: 0xF0, 0x00 (bits 4-7 van byte 0)
-    // Nu:            0xFF, 0x0F (bits 0-7 van byte 0 + bits 0-3 van byte 1)
-    // Dit opent de volledige version-rolling window van de BM1370.
-    // Als de pool 0x3xxxxxxx reject, zet deze regel terug naar 0xF0, 0x00.
-    send6(CMD_WRITE_ALL, 0x00, 0x18, 0xFF, 0x0F, 0xC1, 0x00);
+    //send6(CMD_WRITE_ALL, 0x00, 0x18, 0xFF, 0x0F, 0xC1, 0x00);
+    send6(CMD_WRITE_ALL, 0x00, 0x18, 0xF0, 0x00, 0xC1, 0x00);
 
     // chain inactive
     sendChainInactive();
@@ -86,6 +82,7 @@ uint8_t BM1370::init(uint64_t frequency, uint16_t asic_count, uint32_t difficult
     send6(CMD_WRITE_ALL, 0x00, 0x3C, 0x80, 0x00, 0x8B, 0x00);
 
     // Core Register Control
+    //send6(CMD_WRITE_ALL, 0x00, 0x3C, 0x80, 0x00, 0x80, 0x18);
     send6(CMD_WRITE_ALL, 0x00, 0x3C, 0x80, 0x00, 0x80, 0x0C);
 
     setJobDifficultyMask(difficulty);
@@ -96,13 +93,15 @@ uint8_t BM1370::init(uint64_t frequency, uint16_t asic_count, uint32_t difficult
     // ?
     send6(CMD_WRITE_ALL, 0x00, 0x68, 0x5A, 0xA5, 0x5A, 0xA5);
 
+    // set baud
+    //send6(CMD_WRITE_ALL, 0x00, 0x28, 0x01, 0x30, 0x00, 0x00);
+
     for (uint8_t i = 0; i < chip_counter; i++) {
         uint8_t addr = i * m_addressInterval;
         // Reg_A8
         send6(CMD_WRITE_SINGLE, addr, 0xA8, 0x00, 0x07, 0x01, 0xF0);
         // Misc Control
-        // [TEST] Zelfde wijziging als hierboven, nu per chip
-        send6(CMD_WRITE_SINGLE, addr, 0x18, 0xFF, 0x0F, 0xC1, 0x00);
+        send6(CMD_WRITE_SINGLE, addr, 0x18, 0xF0, 0x00, 0xC1, 0x00);
         // Core Register Control
         send6(CMD_WRITE_SINGLE, addr, 0x3C, 0x80, 0x00, 0x8B, 0x00);
         // Core Register Control
