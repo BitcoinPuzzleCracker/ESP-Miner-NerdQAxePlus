@@ -17,7 +17,7 @@ class MiningInfoBase {
   public:
     virtual ~MiningInfoBase();
 
-    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
+    virtual bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
     virtual bool isValid() const = 0;
     virtual bool isNewWork(uint32_t &last_ntime) const = 0;
     virtual const char* getJobId() const = 0;
