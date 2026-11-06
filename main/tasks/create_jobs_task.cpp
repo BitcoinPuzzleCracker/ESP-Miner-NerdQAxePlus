@@ -29,14 +29,11 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
-// INLINE EXTRANONCE2 GENERATOR — cyclisch 1 t/m 16 hex-karakters
+// INLINE EXTRANONCE2 GENERATOR — Altijd volledig willekeurig (64-bit)
 // ============================================================================
 
 #define EXTRANONCE2_MAX_BYTES 8
 #define EXTRANONCE2_NUM_POOLS 2
-#define E2_JOBS_PER_PHASE     20
-#define E2_HEX_CHARS_MIN      1
-#define E2_HEX_CHARS_MAX      16
 
 #ifndef CAN_SLAVE_MAX
 #define CAN_SLAVE_MAX 8
@@ -45,8 +42,6 @@ pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     uint64_t counter;
     uint64_t seed;
-    int      phase_hex_chars;   // 1 .. 16
-    uint32_t phase_remaining;
     bool     initialized;
 } e2_state_t;
 
@@ -73,43 +68,19 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
     if (len_bytes > EXTRANONCE2_MAX_BYTES) len_bytes = EXTRANONCE2_MAX_BYTES;
 
     int total_bits = len_bytes * 8;
-    int max_hex_chars = len_bytes * 2;   // 8 bytes => 16 hex chars
     uint64_t total_mask = (total_bits >= 64) ? ~0ULL : ((1ULL << total_bits) - 1);
 
     if (!st->initialized) {
         st->seed             = e2_random_u64();
         st->counter          = st->seed;
-        st->phase_hex_chars  = E2_HEX_CHARS_MIN;
-        st->phase_remaining  = E2_JOBS_PER_PHASE;
         st->initialized      = true;
         ESP_LOGI(TAG, "[%s] e2 seed=%016llx len=%d start",
                  name, (unsigned long long) st->seed, len_bytes);
     }
 
-    // Bepaal hoeveel bits deze fase gebruikt (hex_chars * 4)
-    int phase_hex = st->phase_hex_chars;
-    if (phase_hex > max_hex_chars) phase_hex = max_hex_chars;
-    int phase_bits = phase_hex * 4;
-    if (phase_bits > 64) phase_bits = 64;
-
-    // Genereer een nieuwe unieke waarde
+    // Genereer ALTIJD een volledig willekeurig 64-bits getal.
+    // Geen kunstmatige phase-logica meer die de zoekruimte klein houdt.
     uint64_t v = e2_splitmix64(st->counter++);
-
-    if (phase_bits < 64) {
-        v &= ((1ULL << phase_bits) - 1);
-    }
-
-    // Volgende fase na N jobs
-    if (--st->phase_remaining == 0) {
-        st->phase_remaining = E2_JOBS_PER_PHASE;
-        if (st->phase_hex_chars >= max_hex_chars) {
-            st->phase_hex_chars = E2_HEX_CHARS_MIN;   // loop terug
-        } else {
-            st->phase_hex_chars++;
-        }
-        ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
-                 name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
-    }
 
     v &= total_mask;
     v = (v & ~high_bits) | (high_bits & total_mask);
