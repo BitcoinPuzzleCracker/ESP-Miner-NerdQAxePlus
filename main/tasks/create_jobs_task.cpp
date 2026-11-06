@@ -333,12 +333,19 @@ void create_jobs_task(void *pvParameters)
     Board *board = SYSTEM_MODULE.getBoard();
     Asic *asics = board->getAsics();
 
-    ESP_LOGI(TAG, "ASIC Job Interval: %d ms", board->getAsicJobIntervalMs());
+    // =========================================================================
+    // AANPASSING: Forceer de Job Interval op 1000ms (1 seconde).
+    // Dit geeft de chip genoeg tijd om met 35kHz tot 0x3xxxxxxx te rollen,
+    // zonder dat de hashrate inzakt.
+    // =========================================================================
+    int forcedJobInterval = 1000; 
+
+    ESP_LOGI(TAG, "ASIC Job Interval: %d ms", forcedJobInterval);
     SYSTEM_MODULE.notifyMiningStarted();
     ESP_LOGI(TAG, "ASIC Ready!");
 
     TimerHandle_t job_timer = xTimerCreate(TAG,
-        pdMS_TO_TICKS(board->getAsicJobIntervalMs()), pdTRUE, NULL, create_job_timer);
+        pdMS_TO_TICKS(forcedJobInterval), pdTRUE, NULL, create_job_timer);
 
     if (job_timer == NULL) {
         ESP_LOGE(TAG, "Failed to create timer");
@@ -353,8 +360,6 @@ void create_jobs_task(void *pvParameters)
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
 
-    int lastJobInterval = board->getAsicJobIntervalMs();
-
     while (1) {
         if (POWER_MANAGEMENT_MODULE.isShutdown()) {
             ESP_LOGW(TAG, "suspended");
@@ -364,12 +369,8 @@ void create_jobs_task(void *pvParameters)
         pthread_cond_wait(&job_cond, &job_mutex);
         pthread_mutex_unlock(&job_mutex);
 
-        if (board->getAsicJobIntervalMs() != lastJobInterval) {
-            xTimerChangePeriod(job_timer,
-                pdMS_TO_TICKS(board->getAsicJobIntervalMs()), 0);
-            lastJobInterval = board->getAsicJobIntervalMs();
-            continue;
-        }
+        // De dynamische job interval check is verwijderd omdat we deze
+        // nu hardcoded op 1000ms hebben gezet voor de test.
 
         bm_job *next_job = nullptr;
         int active_pool = 0;
