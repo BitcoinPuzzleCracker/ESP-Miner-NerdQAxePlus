@@ -29,19 +29,54 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // ============================================================================
-// INLINE EXTRANONCE2 GENERATOR — Altijd volledig willekeurig (64-bit)
+// INLINE EXTRANONCE2 GENERATOR — Test-vectoren met minimaal 4 hex-karakters
 // ============================================================================
 
 #define EXTRANONCE2_MAX_BYTES 8
 #define EXTRANONCE2_NUM_POOLS 2
+#define E2_JOBS_PER_PHASE     20
+#define E2_HEX_CHARS_MIN      4      // ← was 1, nu minimaal 4 hex-karakters
+#define E2_HEX_CHARS_MAX      16
 
 #ifndef CAN_SLAVE_MAX
 #define CAN_SLAVE_MAX 8
 #endif
 
+// Testvectoren — worden 1x afgelopen bij de start
+// Allemaal minimaal 0x1000 (4 hex-karakters) om duplicates te voorkomen
+static const uint64_t E2_TEST_VECTORS[] = {
+    0x0000000000001000ULL,  // 4 hex
+    0x0000000000001001ULL,
+    0x0000000000001002ULL,
+    0x0000000000001003ULL,
+    0x0000000000001010ULL,
+    0x0000000000001020ULL,
+    0x0000000000001022ULL,
+    0x0000000000001064ULL,
+    0x00000000000010FFULL,
+    0x0000000000001100ULL,
+    0x0000000000001FFFULL,
+    0x000000000000FFFFULL,
+    0x0000000000010000ULL,  // 5 hex
+    0x00000000FFFFFFFFULL,  // 8 hex
+    0x0000000100000000ULL,  // 9 hex
+    0x0000000100000001ULL,
+    0x0123456789ABCDEFULL,  // 16 hex
+    0x7FFFFFFFFFFFFFFFULL,
+    0x8000000000000000ULL,
+    0xFFFFFFFFFFFFFF00ULL,
+    0xFFFFFFFFFFFFFFFEULL,
+    0xFFFFFFFFFFFFFFFFULL,
+};
+#define E2_NUM_TEST_VECTORS (sizeof(E2_TEST_VECTORS) / sizeof(E2_TEST_VECTORS[0]))
+
 typedef struct {
     uint64_t counter;
     uint64_t seed;
+    size_t   tv_idx;
+    int      phase_hex_chars;   // 4 .. 16
+    uint32_t phase_remaining;
+    bool     in_test_vectors;
     bool     initialized;
 } e2_state_t;
 
@@ -68,19 +103,62 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
     if (len_bytes > EXTRANONCE2_MAX_BYTES) len_bytes = EXTRANONCE2_MAX_BYTES;
 
     int total_bits = len_bytes * 8;
+    int max_hex_chars = len_bytes * 2;   // 8 bytes => 16 hex chars
     uint64_t total_mask = (total_bits >= 64) ? ~0ULL : ((1ULL << total_bits) - 1);
 
     if (!st->initialized) {
         st->seed             = e2_random_u64();
         st->counter          = st->seed;
+        st->tv_idx           = 0;
+        st->in_test_vectors  = true;
+        st->phase_hex_chars  = E2_HEX_CHARS_MIN;
+        st->phase_remaining  = E2_JOBS_PER_PHASE;
         st->initialized      = true;
         ESP_LOGI(TAG, "[%s] e2 seed=%016llx len=%d start",
                  name, (unsigned long long) st->seed, len_bytes);
     }
 
-    // Genereer ALTIJD een volledig willekeurig 64-bits getal.
-    // Geen kunstmatige phase-logica meer die de zoekruimte klein houdt.
-    uint64_t v = e2_splitmix64(st->counter++);
+    uint64_t v;
+
+    // --- TESTVECTOREN EERST ---
+    if (st->in_test_vectors) {
+        v = E2_TEST_VECTORS[st->tv_idx++];
+        if (st->tv_idx >= E2_NUM_TEST_VECTORS) {
+            st->in_test_vectors  = false;
+            st->phase_hex_chars  = E2_HEX_CHARS_MIN;
+            st->phase_remaining  = E2_JOBS_PER_PHASE;
+            ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
+                     name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
+        }
+    } else {
+        // Bepaal hoeveel bits deze fase gebruikt (hex_chars * 4)
+        int phase_hex = st->phase_hex_chars;
+        if (phase_hex > max_hex_chars) phase_hex = max_hex_chars;
+        int phase_bits = phase_hex * 4;
+        if (phase_bits > 64) phase_bits = 64;
+
+        v = e2_splitmix64(st->counter++);
+
+        if (phase_bits < 64) {
+            v &= ((1ULL << phase_bits) - 1);
+            // Zorg dat de waarde altijd minstens 4 hex-karakters heeft
+            if (phase_hex >= 4 && phase_bits > 0) {
+                v |= (1ULL << (phase_bits - 1));  // Zet hoogste bit
+            }
+        }
+
+        // Volgende fase na N jobs
+        if (--st->phase_remaining == 0) {
+            st->phase_remaining = E2_JOBS_PER_PHASE;
+            if (st->phase_hex_chars >= max_hex_chars) {
+                st->phase_hex_chars = E2_HEX_CHARS_MIN;   // ← loop terug
+            } else {
+                st->phase_hex_chars++;
+            }
+            ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
+                     name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
+        }
+    }
 
     v &= total_mask;
     v = (v & ~high_bits) | (high_bits & total_mask);
@@ -335,8 +413,6 @@ void create_jobs_task(void *pvParameters)
 
     // =========================================================================
     // AANPASSING: Forceer de Job Interval op 1000ms (1 seconde).
-    // Dit geeft de chip genoeg tijd om met 35kHz tot 0x3xxxxxxx te rollen,
-    // zonder dat de hashrate inzakt.
     // =========================================================================
     int forcedJobInterval = 1000; 
 
@@ -368,9 +444,6 @@ void create_jobs_task(void *pvParameters)
         pthread_mutex_lock(&job_mutex);
         pthread_cond_wait(&job_cond, &job_mutex);
         pthread_mutex_unlock(&job_mutex);
-
-        // De dynamische job interval check is verwijderd omdat we deze
-        // nu hardcoded op 1000ms hebben gezet voor de test.
 
         bm_job *next_job = nullptr;
         int active_pool = 0;
