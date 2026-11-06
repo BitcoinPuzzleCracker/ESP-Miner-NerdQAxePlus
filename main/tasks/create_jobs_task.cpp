@@ -42,40 +42,11 @@ pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 #define CAN_SLAVE_MAX 8
 #endif
 
-// Testvectoren — worden 1x afgelopen bij de start
-static const uint64_t E2_TEST_VECTORS[] = {
-    0x0000000000000001ULL,
-    0x0000000000000002ULL,
-    0x0000000000000003ULL,
-    0x0000000000000004ULL,
-    0x0000000000000010ULL,
-    0x0000000000000020ULL,
-    0x0000000000000022ULL,
-    0x0000000000000064ULL,
-    0x00000000000000FFULL,
-    0x0000000000000100ULL,
-    0x0000000000000FFFULL,
-    0x000000000000FFFFULL,
-    0x0000000000010000ULL,
-    0x00000000FFFFFFFFULL,
-    0x0000000100000000ULL,
-    0x0000000100000001ULL,
-    0x0123456789ABCDEFULL,
-    0x7FFFFFFFFFFFFFFFULL,
-    0x8000000000000000ULL,
-    0xFFFFFFFFFFFFFF00ULL,
-    0xFFFFFFFFFFFFFFFEULL,
-    0xFFFFFFFFFFFFFFFFULL,
-};
-#define E2_NUM_TEST_VECTORS (sizeof(E2_TEST_VECTORS) / sizeof(E2_TEST_VECTORS[0]))
-
 typedef struct {
     uint64_t counter;
     uint64_t seed;
-    size_t   tv_idx;
     int      phase_hex_chars;   // 1 .. 16
     uint32_t phase_remaining;
-    bool     in_test_vectors;
     bool     initialized;
 } e2_state_t;
 
@@ -108,8 +79,6 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
     if (!st->initialized) {
         st->seed             = e2_random_u64();
         st->counter          = st->seed;
-        st->tv_idx           = 0;
-        st->in_test_vectors  = true;
         st->phase_hex_chars  = E2_HEX_CHARS_MIN;
         st->phase_remaining  = E2_JOBS_PER_PHASE;
         st->initialized      = true;
@@ -117,42 +86,29 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
                  name, (unsigned long long) st->seed, len_bytes);
     }
 
-    uint64_t v;
+    // Bepaal hoeveel bits deze fase gebruikt (hex_chars * 4)
+    int phase_hex = st->phase_hex_chars;
+    if (phase_hex > max_hex_chars) phase_hex = max_hex_chars;
+    int phase_bits = phase_hex * 4;
+    if (phase_bits > 64) phase_bits = 64;
 
-    // --- TESTVECTOREN EERST ---
-    if (st->in_test_vectors) {
-        v = E2_TEST_VECTORS[st->tv_idx++];
-        if (st->tv_idx >= E2_NUM_TEST_VECTORS) {
-            st->in_test_vectors  = false;
-            st->phase_hex_chars  = E2_HEX_CHARS_MIN;
-            st->phase_remaining  = E2_JOBS_PER_PHASE;
-            ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
-                     name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
+    // Genereer een nieuwe unieke waarde
+    uint64_t v = e2_splitmix64(st->counter++);
+
+    if (phase_bits < 64) {
+        v &= ((1ULL << phase_bits) - 1);
+    }
+
+    // Volgende fase na N jobs
+    if (--st->phase_remaining == 0) {
+        st->phase_remaining = E2_JOBS_PER_PHASE;
+        if (st->phase_hex_chars >= max_hex_chars) {
+            st->phase_hex_chars = E2_HEX_CHARS_MIN;   // loop terug
+        } else {
+            st->phase_hex_chars++;
         }
-    } else {
-        // Bepaal hoeveel bits deze fase gebruikt (hex_chars * 4)
-        int phase_hex = st->phase_hex_chars;
-        if (phase_hex > max_hex_chars) phase_hex = max_hex_chars;
-        int phase_bits = phase_hex * 4;
-        if (phase_bits > 64) phase_bits = 64;
-
-        v = e2_splitmix64(st->counter++);
-
-        if (phase_bits < 64) {
-            v &= ((1ULL << phase_bits) - 1);
-        }
-
-        // Volgende fase na N jobs
-        if (--st->phase_remaining == 0) {
-            st->phase_remaining = E2_JOBS_PER_PHASE;
-            if (st->phase_hex_chars >= max_hex_chars) {
-                st->phase_hex_chars = E2_HEX_CHARS_MIN;   // ← loop terug
-            } else {
-                st->phase_hex_chars++;
-            }
-            ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
-                     name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
-        }
+        ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
+                 name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
     }
 
     v &= total_mask;
