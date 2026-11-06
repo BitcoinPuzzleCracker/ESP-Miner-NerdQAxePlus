@@ -98,13 +98,10 @@ void PowerManagementTask::checkVrFrequencyChanged()
     static uint32_t lastVrFrequency = 0;
 
     // =========================================================================
-    // AANPASSING: Forceer de rolling frequentie naar 70.000 Hz
-    // Snel genoeg om 0x3xxxxxxx te halen, maar ontziet de UART.
+    // AANPASSING: 35.000 Hz. Samen met de 1000ms Job Interval geeft dit
+    // de perfecte balans voor 12.9 TH/s én de 0x3xxxxxxx rolling.
     // =========================================================================
-    // uint32_t vrFrequency = m_board->getVrFrequency(); // Oude regel
-    
-    uint32_t vrFrequency = 70000; 
-    // =========================================================================
+    uint32_t vrFrequency = 35000; 
 
     if (vrFrequency != lastVrFrequency) {
         m_board->setVrFrequency(vrFrequency);
