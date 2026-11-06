@@ -97,7 +97,14 @@ void PowerManagementTask::checkVrFrequencyChanged()
 {
     static uint32_t lastVrFrequency = 0;
 
-    uint32_t vrFrequency = m_board->getVrFrequency();
+    // =========================================================================
+    // TIJDELIJKE AANPASSING VOOR TEST: Forceer 100.000 Hz
+    // =========================================================================
+    // uint32_t vrFrequency = m_board->getVrFrequency(); // Oude regel
+    
+    uint32_t vrFrequency = 100000; 
+    // =========================================================================
+
     if (vrFrequency != lastVrFrequency) {
         m_board->setVrFrequency(vrFrequency);
         ESP_LOGI(TAG, "setting version rolling frequency to %luHz", vrFrequency);
