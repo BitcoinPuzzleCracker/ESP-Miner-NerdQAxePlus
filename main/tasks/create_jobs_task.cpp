@@ -1,339 +1,531 @@
-#include <algorithm>
-#include <math.h>
+#include <limits.h>
+#include <pthread.h>
+#include <string.h>
+#include <sys/time.h>
 
 #include "esp_log.h"
+#include "esp_system.h"
 #include "esp_timer.h"
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
+#include "esp_random.h"
 #include "mining.h"
-#include "periodic.hpp"
+
+#include "global_state.h"
+#include "create_jobs_task.h"
+#include "can_sender.h"
+#include "can_master_task.h"
 
 #include "boards/board.h"
-#include "fan_controller.h"
-#include "global_state.h"
-#include "influx_task.h"
-#include "nvs_config.h"
-#include "serial.h"
+#include "macros.h"
+#include "system.h"
 
-#define POLL_RATE 2000
+#define PRIMARY 0
+#define SECONDARY 1
 
-static const char *TAG = "power_management";
+static const char *TAG = "create_jobs_task";
 
-// #define MEASURE_LOOP_TIME
+pthread_mutex_t job_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 
-PowerManagementTask::PowerManagementTask()
+pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// ============================================================================
+// INLINE EXTRANONCE2 GENERATOR — Test-vectoren met minimaal 4 hex-karakters
+// ============================================================================
+
+#define EXTRANONCE2_MAX_BYTES 8
+#define EXTRANONCE2_NUM_POOLS 2
+#define E2_JOBS_PER_PHASE     20
+#define E2_HEX_CHARS_MIN      4      // ← was 1, nu minimaal 4 hex-karakters
+#define E2_HEX_CHARS_MAX      16
+
+#ifndef CAN_SLAVE_MAX
+#define CAN_SLAVE_MAX 8
+#endif
+
+// Testvectoren — worden 1x afgelopen bij de start
+// Allemaal minimaal 0x1000 (4 hex-karakters) om duplicates te voorkomen
+static const uint64_t E2_TEST_VECTORS[] = {
+    0x0000000000001000ULL,  // 4 hex
+    0x0000000000001001ULL,
+    0x0000000000001002ULL,
+    0x0000000000001003ULL,
+    0x0000000000001010ULL,
+    0x0000000000001020ULL,
+    0x0000000000001022ULL,
+    0x0000000000001064ULL,
+    0x00000000000010FFULL,
+    0x0000000000001100ULL,
+    0x0000000000001FFFULL,
+    0x000000000000FFFFULL,
+    0x0000000000010000ULL,  // 5 hex
+    0x00000000FFFFFFFFULL,  // 8 hex
+    0x0000000100000000ULL,  // 9 hex
+    0x0000000100000001ULL,
+    0x0123456789ABCDEFULL,  // 16 hex
+    0x7FFFFFFFFFFFFFFFULL,
+    0x8000000000000000ULL,
+    0xFFFFFFFFFFFFFF00ULL,
+    0xFFFFFFFFFFFFFFFEULL,
+    0xFFFFFFFFFFFFFFFFULL,
+};
+#define E2_NUM_TEST_VECTORS (sizeof(E2_TEST_VECTORS) / sizeof(E2_TEST_VECTORS[0]))
+
+typedef struct {
+    uint64_t counter;
+    uint64_t seed;
+    size_t   tv_idx;
+    int      phase_hex_chars;   // 4 .. 16
+    uint32_t phase_remaining;
+    bool     in_test_vectors;
+    bool     initialized;
+} e2_state_t;
+
+static e2_state_t      s_e2_pool[EXTRANONCE2_NUM_POOLS];
+static e2_state_t      s_e2_slave[CAN_SLAVE_MAX];
+static pthread_mutex_t s_e2_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static inline uint64_t e2_splitmix64(uint64_t x)
 {
-    m_mutex = xSemaphoreCreateRecursiveMutex();
+    x += 0x9E3779B97F4A7C15ULL;
+    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+    return x ^ (x >> 31);
 }
 
-void PowerManagementTask::taskWrapper(void *pvParameters)
+static inline uint64_t e2_random_u64(void)
 {
-    PowerManagementTask *powerManagementTask = (PowerManagementTask *) pvParameters;
-    powerManagementTask->task();
+    return ((uint64_t) esp_random() << 32) | esp_random();
 }
 
-void PowerManagementTask::restart()
+static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits, const char *name)
 {
-    ESP_LOGW(TAG, "Shutdown requested ...");
-    // stops the main task
-    lock();
+    if (len_bytes <= 0) len_bytes = EXTRANONCE2_MAX_BYTES;
+    if (len_bytes > EXTRANONCE2_MAX_BYTES) len_bytes = EXTRANONCE2_MAX_BYTES;
 
-    ESP_LOGW(TAG, "HW lock acquired!");
-    // shutdown asics and LDOs before reset
-    shutdown();
+    int total_bits = len_bytes * 8;
+    int max_hex_chars = len_bytes * 2;   // 8 bytes => 16 hex chars
+    uint64_t total_mask = (total_bits >= 64) ? ~0ULL : ((1ULL << total_bits) - 1);
 
-    ESP_LOGW(TAG, "restart");
-    esp_restart();
-
-    // unreachable
-    unlock();
-}
-
-void PowerManagementTask::shutdown()
-{
-    lock();
-    if (m_board) {
-        m_shutdown = true;
-        m_board->shutdown();
+    if (!st->initialized) {
+        st->seed             = e2_random_u64();
+        st->counter          = st->seed;
+        st->tv_idx           = 0;
+        st->in_test_vectors  = true;
+        st->phase_hex_chars  = E2_HEX_CHARS_MIN;
+        st->phase_remaining  = E2_JOBS_PER_PHASE;
+        st->initialized      = true;
+        ESP_LOGI(TAG, "[%s] e2 seed=%016llx len=%d start",
+                 name, (unsigned long long) st->seed, len_bytes);
     }
-    unlock();
-}
 
-uint16_t PowerManagementTask::getFanRPM(int channel)
-{
-    return m_fanController.getRPM(channel);
-}
+    uint64_t v;
 
-void PowerManagementTask::checkCoreVoltageChanged()
-{
-    static uint16_t last_core_voltage = 0;
-
-    uint16_t core_voltage = m_board->getAsicVoltageMillis();
-
-    if (core_voltage != last_core_voltage) {
-        ESP_LOGI(TAG, "setting new vcore voltage to %umV", core_voltage);
-        m_board->setVoltage((float) core_voltage / 1000.0);
-        last_core_voltage = core_voltage;
-    }
-}
-
-void PowerManagementTask::checkAsicFrequencyChanged()
-{
-    static uint16_t last_asic_frequency = 0;
-
-    uint16_t asic_frequency = m_board->getAsicFrequency();
-
-    if (asic_frequency != last_asic_frequency) {
-        ESP_LOGI(TAG, "setting new asic frequency to %uMHz", asic_frequency);
-        if (!m_board->setAsicFrequency((float) asic_frequency)) {
-            ESP_LOGE(TAG, "pll setting not found for %uMHz", asic_frequency);
+    // --- TESTVECTOREN EERST ---
+    if (st->in_test_vectors) {
+        v = E2_TEST_VECTORS[st->tv_idx++];
+        if (st->tv_idx >= E2_NUM_TEST_VECTORS) {
+            st->in_test_vectors  = false;
+            st->phase_hex_chars  = E2_HEX_CHARS_MIN;
+            st->phase_remaining  = E2_JOBS_PER_PHASE;
+            ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
+                     name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
         }
-        last_asic_frequency = asic_frequency;
-    }
-}
+    } else {
+        // Bepaal hoeveel bits deze fase gebruikt (hex_chars * 4)
+        int phase_hex = st->phase_hex_chars;
+        if (phase_hex > max_hex_chars) phase_hex = max_hex_chars;
+        int phase_bits = phase_hex * 4;
+        if (phase_bits > 64) phase_bits = 64;
 
-void PowerManagementTask::checkVrFrequencyChanged()
-{
-    static uint32_t lastVrFrequency = 0;
+        v = e2_splitmix64(st->counter++);
 
-    // =========================================================================
-    // AANPASSING: 50.000 Hz
-    // Samen met 1000ms Job Interval bereikt de teller ~50.000 stappen/sec,
-    // wat ruim voldoende is voor de 0x34 t/m 0x38 range.
-    // =========================================================================
-    uint32_t vrFrequency = 50000;
-
-    if (vrFrequency != lastVrFrequency) {
-        m_board->setVrFrequency(vrFrequency);
-        ESP_LOGI(TAG, "setting version rolling frequency to %luHz", vrFrequency);
-        lastVrFrequency = vrFrequency;
-    }
-}
-
-
-void PowerManagementTask::logChipTemps()
-{
-    size_t offset = 0;
-
-    // no chip temp to report
-    if (m_board->getMaxChipTemp() == 0.0f) {
-        return;
-    }
-
-    // Iterate through each ASIC and append its count to the log message
-    for (int i = 0; i < m_board->getAsicCount(); i++) {
-        offset += snprintf(m_logBuffer + offset, sizeof(m_logBuffer) - offset, "%.2f°C / ", m_board->getChipTemp(i));
-    }
-    if (offset >= 2) {
-        m_logBuffer[offset - 2] = 0; // remove trailing slash
-    }
-
-    ESP_LOGI(TAG, "chip temperatures: %s", m_logBuffer);
-}
-
-void PowerManagementTask::create_job_timer(TimerHandle_t xTimer)
-{
-    // Retrieve 'this' pointer from timer ID
-    PowerManagementTask *task = (PowerManagementTask *) pvTimerGetTimerID(xTimer);
-    if (!task) {
-        return;
-    }
-    task->trigger();
-}
-
-void PowerManagementTask::trigger()
-{
-    pthread_mutex_lock(&m_loop_mutex);
-    pthread_cond_signal(&m_loop_cond);
-    pthread_mutex_unlock(&m_loop_mutex);
-}
-
-bool PowerManagementTask::startTimer()
-{
-    // Create the timer
-    m_timer = xTimerCreate(TAG, pdMS_TO_TICKS(POLL_RATE), pdTRUE, (void *) this, create_job_timer);
-
-    if (m_timer == NULL) {
-        ESP_LOGE(TAG, "Failed to create timer");
-        return false;
-    }
-
-    // Start the timer
-    if (xTimerStart(m_timer, 0) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to start timer");
-        return false;
-    }
-    return true;
-}
-
-void PowerManagementTask::readAndPublishPowerTelemetry()
-{
-    if (!m_board->isBuckInitialized()) {
-        return;
-    }
-
-    static Periodic every_15s(sec_to_us(15), /*start_immediately=*/true);
-
-    // request buck telemetry
-    if (every_15s.due()) {
-        m_board->requestBuckTelemtry();
-    }
-
-    float vin = m_board->getVin();
-    float iin = m_board->getIin();
-    float pin = m_board->getPin();
-    float pout = m_board->getPout();
-    float vout = m_board->getVout();
-    float iout = m_board->getIout();
-
-    m_vrTemp = m_board->getVRTemp();
-    m_vrTempInt = m_board->getVRTempInt();
-
-    ESP_LOGI(TAG, "vin: %.2f, iin: %.2f, pin: %.2f, vout: %.2f, iout: %.2f, pout: %.2f, vr-temp: %.2f, vr-temp-int: %.2f", vin, iin,
-             pin, vout, iout, pout, m_vrTemp, m_vrTempInt);
-
-    influx_task_set_pwr(vin, iin, pin, vout, iout, pout);
-
-    // currently only implemented for boards with TPS536x7
-    uint32_t status = 0;
-    Board::Error error = m_board->getFault(&status);
-    if (error != Board::Error::NONE) {
-        SYSTEM_MODULE.setBoardError(error, status);
-        m_board->setVoltage(0.0);
-    }
-
-    m_voltage = vin * 1000.0;
-    m_current = iin * 1000.0;
-    m_power = pin;
-}
-
-void PowerManagementTask::applyAsicSettings()
-{
-    // not available when asics are shutdown
-    if (m_shutdown) {
-        return;
-    }
-
-    // don't change frequency or voltage if
-    // asics haven't been initialized
-    if (!m_board->isInitialized()) {
-        return;
-    }
-
-    // check if asic voltage changed
-    checkCoreVoltageChanged();
-
-    // check if asic frequency changed
-    checkAsicFrequencyChanged();
-
-    // check if version rolling frequency changed
-    checkVrFrequencyChanged();
-}
-
-void PowerManagementTask::requestChipTemps()
-{
-    // temperature measurements don't work before ASICs
-    // are initialized
-    if (!m_board->isInitialized()) {
-        return;
-    }
-
-    m_board->requestChipTemps();
-}
-
-void PowerManagementTask::task()
-{
-    m_board = SYSTEM_MODULE.getBoard();
-
-    // use manual invert polarity setting
-    bool invert = m_board->isInvertFanPolarityEnabled();
-
-    m_board->setFanPolarity(invert);
-
-    m_fanController.init(m_board, POLL_RATE);
-
-    vTaskDelay(pdMS_TO_TICKS(1000));
-    startTimer();
-
-    uint64_t last_time = esp_timer_get_time();
-    while (1) {
-        pthread_mutex_lock(&m_loop_mutex);
-        pthread_cond_wait(&m_loop_cond, &m_loop_mutex); // Wait for the timer
-        pthread_mutex_unlock(&m_loop_mutex);
-
-        uint64_t start = esp_timer_get_time();
-        lock();
-
-        applyAsicSettings();
-
-        // request chip temps
-        requestChipTemps();
-
-        logChipTemps();
-
-        readAndPublishPowerTelemetry();
-
-        // collect temperatures
-        // get the max of all asic measuring temp sensors
-        float tmp1075Max = 0.0f;
-        for (int i = 0; i < m_board->getNumTempSensors(); i++) {
-            float tmp = m_board->getTemperature(i);
-            if (tmp) {
-                ESP_LOGI(TAG, "Temperature %d: %.2f C", i, tmp);
+        if (phase_bits < 64) {
+            v &= ((1ULL << phase_bits) - 1);
+            // Zorg dat de waarde altijd minstens 4 hex-karakters heeft
+            if (phase_hex >= 4 && phase_bits > 0) {
+                v |= (1ULL << (phase_bits - 1));  // Zet hoogste bit
             }
-            tmp1075Max = std::max(tmp1075Max, tmp);
         }
 
-        // get max temp of all chips
-        // returns 0 if not available on the hardware
-        float intChipTempMax = m_board->getMaxChipTemp();
-
-#ifdef NERDQAXEPLUS
-        // NQ+ needs special care - the reading of chip internal temp sensors is way
-        // too slow for the PID, so we need to stay compatible.
-        // we use the max temp of board temp sensors and ASICs
-        // note: m_chipTempMax is not mutexed, single assignment required
-        m_chipTempMax = std::max(tmp1075Max, intChipTempMax);
-#else
-        // on other devices that have the TMUX like the QX we only use
-        // the chip temps for the PID
-        // note: m_chipTempMax is not mutexed, single assignment required
-        m_chipTempMax = intChipTempMax ? intChipTempMax : tmp1075Max;
-#endif
-
-        influx_task_set_temperature(m_chipTempMax, m_vrTemp);
-
-        // Run fan controller (reads RPM, drives fans, updates overheat flags)
-        m_fanController.update(m_chipTempMax, m_vrTemp);
-
-        // Shutdown if any fan channel reports overheat
-        if (m_fanController.isOverheated(0) || m_fanController.isOverheated(1)) {
-            uint32_t status = ((uint32_t) m_chipTempMax << 24) | ((uint32_t) m_fanController.getOverheatTemp(0) << 16) |
-                              ((uint32_t) m_vrTemp << 8) | ((uint32_t) m_fanController.getOverheatTemp(1));
-
-            // over temperature — ASIC takes priority over VReg-only
-            Board::Error overheatErr = Board::Error::VREG_TEMP_FAULT;
-            if (m_fanController.isOverheated(0)) overheatErr = Board::Error::TEMP_FAULT;
-            SYSTEM_MODULE.setBoardError(overheatErr, status);
-
-            // disables the buck
-            m_board->setVoltage(0.0);
-            ESP_LOGE(TAG, "System overheated (chip=%.1f°C/thresh=%d°C vr=%.2f°C/thresh=%d°C) - Shutting down asic voltage",
-                     m_chipTempMax, m_fanController.getOverheatTemp(0), m_vrTemp, m_fanController.getOverheatTemp(1));
+        // Volgende fase na N jobs
+        if (--st->phase_remaining == 0) {
+            st->phase_remaining = E2_JOBS_PER_PHASE;
+            if (st->phase_hex_chars >= max_hex_chars) {
+                st->phase_hex_chars = E2_HEX_CHARS_MIN;   // ← loop terug
+            } else {
+                st->phase_hex_chars++;
+            }
+            ESP_LOGI(TAG, "[%s] e2 phase -> %d hex chars (x%u)",
+                     name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
         }
-        influx_set_fan(m_fanController.getSpeedPerc(0), (float) m_fanController.getRPM(0), m_fanController.getSpeedPerc(1),
-                       (float) m_fanController.getRPM(1));
-        unlock();
-#ifdef MEASURE_LOOP_TIME
-        // checks if loop takes too much time
-        uint64_t end = esp_timer_get_time();
-        uint64_t duration = (end - start) / 1000llu;
-        uint64_t interval = (start - last_time) / 1000llu;
-        if (duration > POLL_RATE) {
-            ESP_LOGE(TAG, "loop taking more then %dms (%llums, interval: %llu)", POLL_RATE, duration, interval);
+    }
+
+    v &= total_mask;
+    v = (v & ~high_bits) | (high_bits & total_mask);
+    return v;
+}
+
+static uint64_t e2_next_pool(int pool, int len_bytes)
+{
+    if (pool < 0 || pool >= EXTRANONCE2_NUM_POOLS) pool = 0;
+    pthread_mutex_lock(&s_e2_lock);
+    uint64_t v = e2_state_next(&s_e2_pool[pool], len_bytes, 0,
+                               pool ? "Sec" : "Pri");
+    pthread_mutex_unlock(&s_e2_lock);
+    return v;
+}
+
+static uint64_t e2_next_slave(uint8_t slave_id, int len_bytes)
+{
+    if (slave_id >= CAN_SLAVE_MAX) return 0;
+    uint64_t high_bits = ((uint64_t) slave_id) << 56;
+    char name[8];
+    snprintf(name, sizeof(name), "S%u", slave_id);
+    pthread_mutex_lock(&s_e2_lock);
+    uint64_t v = e2_state_next(&s_e2_slave[slave_id], len_bytes, high_bits, name);
+    pthread_mutex_unlock(&s_e2_lock);
+    return v;
+}
+
+// ============================================================================
+// MiningInfoBase
+// ============================================================================
+
+MiningInfoBase::~MiningInfoBase() {}
+
+// ============================================================================
+// MiningInfoV1
+// ============================================================================
+
+class MiningInfoV1 : public MiningInfoBase {
+  public:
+    mining_notify *current_job = nullptr;
+
+    char *extranonce_str = nullptr;
+    int extranonce_2_len = 0;
+
+    char *next_extranonce_str = nullptr;
+    int next_extranonce_2_len = 0;
+
+    uint32_t stratum_difficulty = 8192;
+    uint32_t active_stratum_difficulty = 8192;
+    uint32_t version_mask = 0;
+
+  public:
+    MiningInfoV1()
+    {
+        current_job = (mining_notify *) CALLOC(1, sizeof(mining_notify));
+    }
+
+    ~MiningInfoV1() override
+    {
+        safe_free(extranonce_str);
+        safe_free(next_extranonce_str);
+        if (current_job) {
+            safe_free(current_job->job_id);
+            safe_free(current_job->coinbase_1);
+            safe_free(current_job->coinbase_2);
+            free(current_job);
         }
-        last_time = start;
-#endif
+    }
+
+    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
+    {
+        char extranonce_2_str[extranonce_2_len * 2 + 1];
+        snprintf(extranonce_2_str, sizeof(extranonce_2_str),
+                 "%0*llx", (int) extranonce_2_len * 2,
+                 (unsigned long long) extranonce_2);
+
+        int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) +
+                              strlen(extranonce_2_str) + strlen(current_job->coinbase_2);
+        char *coinbase_tx = (char *) MALLOC(coinbase_tx_len + 1);
+        snprintf(coinbase_tx, coinbase_tx_len + 1, "%s%s%s%s",
+                 current_job->coinbase_1, extranonce_str,
+                 extranonce_2_str, current_job->coinbase_2);
+
+        char merkle_root[65];
+        calculate_merkle_root_hash(coinbase_tx, current_job->_merkle_branches,
+                                   current_job->n_merkle_branches, merkle_root);
+        free(coinbase_tx);
+
+        bm_job *next_job = (bm_job *) MALLOC(sizeof(bm_job));
+        construct_bm_job(current_job, merkle_root, version_mask, next_job);
+        next_job->jobid = strdup(current_job->job_id);
+        next_job->extranonce2 = strdup(extranonce_2_str);
+        next_job->pool_diff = active_stratum_difficulty;
+        next_job->pool_id = pool_id;
+        next_job->asic_diff = asic_diff;
+
+        return next_job;
+    }
+
+    bool isValid() const override
+    {
+        return current_job->ntime != 0 && extranonce_str && current_job->job_id &&
+               current_job->coinbase_1 && current_job->coinbase_2;
+    }
+
+    bool isNewWork(uint32_t &last_ntime) const override
+    {
+        if (last_ntime != current_job->ntime) {
+            last_ntime = current_job->ntime;
+            return true;
+        }
+        return false;
+    }
+
+    const char* getJobId() const override { return current_job->job_id; }
+    uint32_t getActiveDifficulty() const override { return active_stratum_difficulty; }
+    uint32_t getVersionMask() const override { return version_mask; }
+
+    void invalidate() override
+    {
+        current_job->ntime = 0;
+        safe_free(extranonce_str);
+        safe_free(next_extranonce_str);
+        safe_free(current_job->job_id);
+        safe_free(current_job->coinbase_1);
+        safe_free(current_job->coinbase_2);
+    }
+
+    void set_version_mask(uint32_t mask) { version_mask = mask; }
+
+    bool set_difficulty(uint32_t difficulty)
+    {
+        bool is_new = stratum_difficulty != difficulty;
+        stratum_difficulty = difficulty;
+        return is_new;
+    }
+
+    void set_enonce(char *enonce, int enonce2_len)
+    {
+        safe_free(extranonce_str);
+        extranonce_str = strdup(enonce);
+        extranonce_2_len = enonce2_len;
+    }
+
+    void set_next_enonce(char *enonce, int enonce2_len)
+    {
+        safe_free(next_extranonce_str);
+        next_extranonce_str = strdup(enonce);
+        next_extranonce_2_len = enonce2_len;
+    }
+
+    void create_job_mining_notify(mining_notify *notify)
+    {
+        if (next_extranonce_str) {
+            safe_free(extranonce_str);
+            extranonce_str = strdup(next_extranonce_str);
+            extranonce_2_len = next_extranonce_2_len;
+            safe_free(next_extranonce_str);
+            next_extranonce_2_len = 0;
+        }
+
+        safe_free(current_job->job_id);
+        safe_free(current_job->coinbase_1);
+        safe_free(current_job->coinbase_2);
+
+        memcpy(current_job, notify, sizeof(mining_notify));
+        current_job->job_id    = strdup(notify->job_id);
+        current_job->coinbase_1 = strdup(notify->coinbase_1);
+        current_job->coinbase_2 = strdup(notify->coinbase_2);
+
+        active_stratum_difficulty = stratum_difficulty;
+    }
+};
+
+static MiningInfoV1 s_miningInfoV1[2] = {MiningInfoV1{}, MiningInfoV1{}};
+MiningInfoBase* miningInfo[2] = {&s_miningInfoV1[0], &s_miningInfoV1[1]};
+
+#define min(a, b) ((a < b) ? (a) : (b))
+#define max(a, b) ((a > b) ? (a) : (b))
+
+static void create_job_timer(TimerHandle_t xTimer)
+{
+    pthread_mutex_lock(&job_mutex);
+    pthread_cond_signal(&job_cond);
+    pthread_mutex_unlock(&job_mutex);
+}
+
+void trigger_job_creation()
+{
+    pthread_mutex_lock(&job_mutex);
+    pthread_cond_signal(&job_cond);
+    pthread_mutex_unlock(&job_mutex);
+}
+
+static MiningInfoV1* ensureV1(int pool)
+{
+    if (miningInfo[pool] != &s_miningInfoV1[pool]) {
+        s_miningInfoV1[pool].invalidate();
+        miningInfo[pool] = &s_miningInfoV1[pool];
+    }
+    return &s_miningInfoV1[pool];
+}
+
+void create_job_set_version_mask(int pool, uint32_t mask)
+{
+    PThreadGuard g(current_stratum_job_mutex);
+    ensureV1(pool)->set_version_mask(mask);
+}
+
+bool create_job_set_difficulty(int pool, uint32_t difficulty)
+{
+    PThreadGuard g(current_stratum_job_mutex);
+    return ensureV1(pool)->set_difficulty(difficulty);
+}
+
+void create_job_set_enonce(int pool, char *enonce, int enonce2_len)
+{
+    PThreadGuard g(current_stratum_job_mutex);
+    ensureV1(pool)->set_enonce(enonce, enonce2_len);
+}
+
+void set_next_enonce(int pool, char *enonce, int enonce2_len)
+{
+    PThreadGuard g(current_stratum_job_mutex);
+    ensureV1(pool)->set_next_enonce(enonce, enonce2_len);
+}
+
+void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
+{
+    {
+        PThreadGuard g(current_stratum_job_mutex);
+        if (abandonWork) {
+            asicJobs.cleanJobs(pool);
+        }
+        ensureV1(pool)->create_job_mining_notify(notify);
+    }
+    trigger_job_creation();
+}
+
+void create_job_invalidate(int pool)
+{
+    PThreadGuard g(current_stratum_job_mutex);
+    miningInfo[pool]->invalidate();
+    asicJobs.cleanJobs(pool);
+}
+
+void create_jobs_task(void *pvParameters)
+{
+    Board *board = SYSTEM_MODULE.getBoard();
+    Asic *asics = board->getAsics();
+
+    // =========================================================================
+    // AANPASSING: Forceer de Job Interval op 1000ms (1 seconde).
+    // =========================================================================
+    int forcedJobInterval = 1000; 
+
+    ESP_LOGI(TAG, "ASIC Job Interval: %d ms", forcedJobInterval);
+    SYSTEM_MODULE.notifyMiningStarted();
+    ESP_LOGI(TAG, "ASIC Ready!");
+
+    TimerHandle_t job_timer = xTimerCreate(TAG,
+        pdMS_TO_TICKS(forcedJobInterval), pdTRUE, NULL, create_job_timer);
+
+    if (job_timer == NULL) {
+        ESP_LOGE(TAG, "Failed to create timer");
+        return;
+    }
+
+    if (xTimerStart(job_timer, 0) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to start timer");
+        return;
+    }
+
+    uint32_t last_ntime[2]{0};
+    uint64_t last_submit_time = 0;
+
+    while (1) {
+        if (POWER_MANAGEMENT_MODULE.isShutdown()) {
+            ESP_LOGW(TAG, "suspended");
+            vTaskSuspend(NULL);
+        }
+        pthread_mutex_lock(&job_mutex);
+        pthread_cond_wait(&job_cond, &job_mutex);
+        pthread_mutex_unlock(&job_mutex);
+
+        bm_job *next_job = nullptr;
+        int active_pool = 0;
+        const char *active_pool_str = "";
+
+        if (!STRATUM_MANAGER) {
+            continue;
+        }
+
+        active_pool = STRATUM_MANAGER->getNextActivePool();
+        active_pool_str = active_pool ? "Sec" : "Pri";
+
+        int e2_len;
+        {
+            PThreadGuard g(current_stratum_job_mutex);
+            e2_len = s_miningInfoV1[active_pool].extranonce_2_len;
+            if (e2_len <= 0) e2_len = EXTRANONCE2_MAX_BYTES;
+        }
+
+        { // scope for mutex
+            PThreadGuard g(current_stratum_job_mutex);
+
+            MiningInfoBase *mi = miningInfo[active_pool];
+
+            if (!mi->isValid() || !asics) {
+                continue;
+            }
+
+            if (mi->isNewWork(last_ntime[active_pool])) {
+                ESP_LOGI(TAG, "(%s) New Work Received %s",
+                         active_pool_str, mi->getJobId());
+            }
+
+            uint64_t e2 = e2_next_pool(active_pool, e2_len);
+
+            uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(
+                                     active_pool, mi->getActiveDifficulty());
+
+            next_job = mi->buildBmJob(e2, active_pool, asic_diff);
+
+            ESP_LOGI(TAG, "(%s) e2=%0*llx",
+                     active_pool_str, e2_len * 2,
+                     (unsigned long long) e2);
+        } // mutex
+
+        asics->setJobDifficultyMask(next_job->asic_diff);
+
+        uint64_t current_time = esp_timer_get_time();
+        if (last_submit_time) {
+            ESP_LOGD(TAG, "(%s) job interval %dms", active_pool_str,
+                     (int) ((current_time - last_submit_time) / 1e3));
+        }
+        last_submit_time = current_time;
+
+        int asic_job_id = asics->sendWork(0, next_job);
+
+        ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X",
+                 active_pool_str, active_pool, asic_job_id);
+
+        asicJobs.storeJob(next_job, asic_job_id);
+
+        // --- CAN slaves ---
+        for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
+            if (!can_master_is_slave_active(slave)) continue;
+
+            uint64_t e2 = e2_next_slave(slave, e2_len);
+
+            bm_job *slave_job = nullptr;
+            {
+                PThreadGuard g(current_stratum_job_mutex);
+                MiningInfoBase *mi = miningInfo[active_pool];
+                if (mi->isValid()) {
+                    uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(
+                                             active_pool, mi->getActiveDifficulty());
+                    slave_job = mi->buildBmJob(e2, active_pool, asic_diff);
+                }
+            }
+
+            if (slave_job) {
+                can_send_raw_job(slave, (uint8_t) asic_job_id, slave_job);
+                slaveAsicJobs[slave].storeJob(slave_job, asic_job_id);
+            }
+        }
     }
 }
