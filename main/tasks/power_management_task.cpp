@@ -86,13 +86,15 @@ void PowerManagementTask::checkVrFrequencyChanged()
     static uint32_t lastVrFrequency = 0;
 
     // =====================================================================
-    // VARIANT A: Version rolling AAN op 35.000 Hz
+    // VARIANT B: Version rolling UIT (0 Hz)
+    // De chip rolt niet meer. Versie blijft permanent op 0x20000000.
+    // Test: daalt de hashrate? Komen er meer duplicates?
     // =====================================================================
-    uint32_t vrFrequency = 35000;
+    uint32_t vrFrequency = 0;
 
     if (vrFrequency != lastVrFrequency) {
         m_board->setVrFrequency(vrFrequency);
-        ESP_LOGI(TAG, "setting version rolling frequency to %luHz", vrFrequency);
+        ESP_LOGI(TAG, "setting version rolling frequency to %luHz (DISABLED)", vrFrequency);
         lastVrFrequency = vrFrequency;
     }
 }
@@ -149,23 +151,29 @@ void PowerManagementTask::readAndPublishPowerTelemetry()
     if (every_15s.due()) {
         m_board->requestBuckTelemtry();
     }
+
     float vin = m_board->getVin();
     float iin = m_board->getIin();
     float pin = m_board->getPin();
     float pout = m_board->getPout();
     float vout = m_board->getVout();
     float iout = m_board->getIout();
+
     m_vrTemp = m_board->getVRTemp();
     m_vrTempInt = m_board->getVRTempInt();
+
     ESP_LOGI(TAG, "vin: %.2f, iin: %.2f, pin: %.2f, vout: %.2f, iout: %.2f, pout: %.2f, vr-temp: %.2f, vr-temp-int: %.2f",
              vin, iin, pin, vout, iout, pout, m_vrTemp, m_vrTempInt);
+
     influx_task_set_pwr(vin, iin, pin, vout, iout, pout);
+
     uint32_t status = 0;
     Board::Error error = m_board->getFault(&status);
     if (error != Board::Error::NONE) {
         SYSTEM_MODULE.setBoardError(error, status);
         m_board->setVoltage(0.0);
     }
+
     m_voltage = vin * 1000.0;
     m_current = iin * 1000.0;
     m_power = pin;
@@ -195,12 +203,15 @@ void PowerManagementTask::task()
     vTaskDelay(pdMS_TO_TICKS(1000));
     startTimer();
 
+    uint64_t last_time = esp_timer_get_time();
     while (1) {
         pthread_mutex_lock(&m_loop_mutex);
         pthread_cond_wait(&m_loop_cond, &m_loop_mutex);
         pthread_mutex_unlock(&m_loop_mutex);
 
+        uint64_t start = esp_timer_get_time();
         lock();
+
         applyAsicSettings();
         requestChipTemps();
         logChipTemps();
@@ -212,12 +223,14 @@ void PowerManagementTask::task()
             if (tmp) ESP_LOGI(TAG, "Temperature %d: %.2f C", i, tmp);
             tmp1075Max = std::max(tmp1075Max, tmp);
         }
+
         float intChipTempMax = m_board->getMaxChipTemp();
 #ifdef NERDQAXEPLUS
         m_chipTempMax = std::max(tmp1075Max, intChipTempMax);
 #else
         m_chipTempMax = intChipTempMax ? intChipTempMax : tmp1075Max;
 #endif
+
         influx_task_set_temperature(m_chipTempMax, m_vrTemp);
         m_fanController.update(m_chipTempMax, m_vrTemp);
 
@@ -228,10 +241,20 @@ void PowerManagementTask::task()
             if (m_fanController.isOverheated(0)) overheatErr = Board::Error::TEMP_FAULT;
             SYSTEM_MODULE.setBoardError(overheatErr, status);
             m_board->setVoltage(0.0);
-            ESP_LOGE(TAG, "System overheated - Shutting down asic voltage");
+            ESP_LOGE(TAG, "System overheated (chip=%.1f°C vr=%.2f°C) - Shutting down asic voltage",
+                     m_chipTempMax, m_vrTemp);
         }
         influx_set_fan(m_fanController.getSpeedPerc(0), (float) m_fanController.getRPM(0),
                        m_fanController.getSpeedPerc(1), (float) m_fanController.getRPM(1));
         unlock();
+#ifdef MEASURE_LOOP_TIME
+        uint64_t end = esp_timer_get_time();
+        uint64_t duration = (end - start) / 1000llu;
+        uint64_t interval = (start - last_time) / 1000llu;
+        if (duration > POLL_RATE) {
+            ESP_LOGE(TAG, "loop taking more then %dms (%llums, interval: %llu)", POLL_RATE, duration, interval);
+        }
+        last_time = start;
+#endif
     }
 }
