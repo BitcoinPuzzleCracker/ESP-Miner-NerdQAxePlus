@@ -28,24 +28,18 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// ============================================================================
-// INLINE EXTRANONCE2 GENERATOR — Test-vectoren met minimaal 4 hex-karakters
-// ============================================================================
-
 #define EXTRANONCE2_MAX_BYTES 8
 #define EXTRANONCE2_NUM_POOLS 2
 #define E2_JOBS_PER_PHASE     20
-#define E2_HEX_CHARS_MIN      4      // ← was 1, nu minimaal 4 hex-karakters
+#define E2_HEX_CHARS_MIN      4
 #define E2_HEX_CHARS_MAX      16
 
 #ifndef CAN_SLAVE_MAX
 #define CAN_SLAVE_MAX 8
 #endif
 
-// Testvectoren — worden 1x afgelopen bij de start
-// Allemaal minimaal 0x1000 (4 hex-karakters) om duplicates te voorkomen
 static const uint64_t E2_TEST_VECTORS[] = {
-    0x0000000000001000ULL,  // 4 hex
+    0x0000000000001000ULL,
     0x0000000000001001ULL,
     0x0000000000001002ULL,
     0x0000000000001003ULL,
@@ -57,11 +51,11 @@ static const uint64_t E2_TEST_VECTORS[] = {
     0x0000000000001100ULL,
     0x0000000000001FFFULL,
     0x000000000000FFFFULL,
-    0x0000000000010000ULL,  // 5 hex
-    0x00000000FFFFFFFFULL,  // 8 hex
-    0x0000000100000000ULL,  // 9 hex
+    0x0000000000010000ULL,
+    0x00000000FFFFFFFFULL,
+    0x0000000100000000ULL,
     0x0000000100000001ULL,
-    0x0123456789ABCDEFULL,  // 16 hex
+    0x0123456789ABCDEFULL,
     0x7FFFFFFFFFFFFFFFULL,
     0x8000000000000000ULL,
     0xFFFFFFFFFFFFFF00ULL,
@@ -74,7 +68,7 @@ typedef struct {
     uint64_t counter;
     uint64_t seed;
     size_t   tv_idx;
-    int      phase_hex_chars;   // 4 .. 16
+    int      phase_hex_chars;
     uint32_t phase_remaining;
     bool     in_test_vectors;
     bool     initialized;
@@ -103,7 +97,7 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
     if (len_bytes > EXTRANONCE2_MAX_BYTES) len_bytes = EXTRANONCE2_MAX_BYTES;
 
     int total_bits = len_bytes * 8;
-    int max_hex_chars = len_bytes * 2;   // 8 bytes => 16 hex chars
+    int max_hex_chars = len_bytes * 2;
     uint64_t total_mask = (total_bits >= 64) ? ~0ULL : ((1ULL << total_bits) - 1);
 
     if (!st->initialized) {
@@ -120,7 +114,6 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
 
     uint64_t v;
 
-    // --- TESTVECTOREN EERST ---
     if (st->in_test_vectors) {
         v = E2_TEST_VECTORS[st->tv_idx++];
         if (st->tv_idx >= E2_NUM_TEST_VECTORS) {
@@ -131,7 +124,6 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
                      name, st->phase_hex_chars, E2_JOBS_PER_PHASE);
         }
     } else {
-        // Bepaal hoeveel bits deze fase gebruikt (hex_chars * 4)
         int phase_hex = st->phase_hex_chars;
         if (phase_hex > max_hex_chars) phase_hex = max_hex_chars;
         int phase_bits = phase_hex * 4;
@@ -141,17 +133,15 @@ static uint64_t e2_state_next(e2_state_t *st, int len_bytes, uint64_t high_bits,
 
         if (phase_bits < 64) {
             v &= ((1ULL << phase_bits) - 1);
-            // Zorg dat de waarde altijd minstens 4 hex-karakters heeft
             if (phase_hex >= 4 && phase_bits > 0) {
-                v |= (1ULL << (phase_bits - 1));  // Zet hoogste bit
+                v |= (1ULL << (phase_bits - 1));
             }
         }
 
-        // Volgende fase na N jobs
         if (--st->phase_remaining == 0) {
             st->phase_remaining = E2_JOBS_PER_PHASE;
             if (st->phase_hex_chars >= max_hex_chars) {
-                st->phase_hex_chars = E2_HEX_CHARS_MIN;   // ← loop terug
+                st->phase_hex_chars = E2_HEX_CHARS_MIN;
             } else {
                 st->phase_hex_chars++;
             }
@@ -187,26 +177,15 @@ static uint64_t e2_next_slave(uint8_t slave_id, int len_bytes)
     return v;
 }
 
-// ============================================================================
-// MiningInfoBase
-// ============================================================================
-
 MiningInfoBase::~MiningInfoBase() {}
-
-// ============================================================================
-// MiningInfoV1
-// ============================================================================
 
 class MiningInfoV1 : public MiningInfoBase {
   public:
     mining_notify *current_job = nullptr;
-
     char *extranonce_str = nullptr;
     int extranonce_2_len = 0;
-
     char *next_extranonce_str = nullptr;
     int next_extranonce_2_len = 0;
-
     uint32_t stratum_difficulty = 8192;
     uint32_t active_stratum_difficulty = 8192;
     uint32_t version_mask = 0;
@@ -411,10 +390,7 @@ void create_jobs_task(void *pvParameters)
     Board *board = SYSTEM_MODULE.getBoard();
     Asic *asics = board->getAsics();
 
-    // =========================================================================
-    // AANPASSING: Forceer de Job Interval op 1000ms (1 seconde).
-    // =========================================================================
-    int forcedJobInterval = 1000; 
+    int forcedJobInterval = 1000;
 
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", forcedJobInterval);
     SYSTEM_MODULE.notifyMiningStarted();
@@ -463,7 +439,7 @@ void create_jobs_task(void *pvParameters)
             if (e2_len <= 0) e2_len = EXTRANONCE2_MAX_BYTES;
         }
 
-        { // scope for mutex
+        {
             PThreadGuard g(current_stratum_job_mutex);
 
             MiningInfoBase *mi = miningInfo[active_pool];
@@ -487,7 +463,7 @@ void create_jobs_task(void *pvParameters)
             ESP_LOGI(TAG, "(%s) e2=%0*llx",
                      active_pool_str, e2_len * 2,
                      (unsigned long long) e2);
-        } // mutex
+        }
 
         asics->setJobDifficultyMask(next_job->asic_diff);
 
@@ -505,7 +481,6 @@ void create_jobs_task(void *pvParameters)
 
         asicJobs.storeJob(next_job, asic_job_id);
 
-        // --- CAN slaves ---
         for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
             if (!can_master_is_slave_active(slave)) continue;
 
