@@ -43,18 +43,19 @@ uint32_t BM1370::getDefaultVrFrequency() {
 uint8_t BM1370::init(uint64_t frequency, uint16_t asic_count, uint32_t difficulty, uint32_t vrFrequency)
 {
     // =====================================================================
-    // VARIANT A: version rolling masker = 0xFFFF (rollen TOEGESTAAN)
+    // VARIANT B: version rolling masker = 0x0000 (rollen VERBODEN)
+    // De chip mag GEEN versie-bits aanpassen.
+    // Versie blijft permanent op 0x20000000.
     // =====================================================================
-    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF);
-    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF);
-    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF);
-    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF);
-    // =====================================================================
+    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0x00, 0x00);
+    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0x00, 0x00);
+    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0x00, 0x00);
+    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0x00, 0x00);
 
     int chip_counter = count_asics();
     ESP_LOGIE(chip_counter == asic_count, TAG, "%i chip(s) detected on the chain, expected %i", chip_counter, asic_count);
 
-    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF);
+    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0x00, 0x00);
 
     // Reg_A8
     send6(CMD_WRITE_ALL, 0x00, 0xA8, 0x00, 0x07, 0x00, 0x00);
@@ -100,7 +101,8 @@ uint8_t BM1370::init(uint64_t frequency, uint16_t asic_count, uint32_t difficult
 
     setVrFrequency(vrFrequency);
 
-    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0xFF, 0xFF);
+    // Laatste masker-bevestiging
+    send6(CMD_WRITE_ALL, 0x00, 0xA4, 0x90, 0x00, 0x00, 0x00);
 
     return chip_counter;
 }
