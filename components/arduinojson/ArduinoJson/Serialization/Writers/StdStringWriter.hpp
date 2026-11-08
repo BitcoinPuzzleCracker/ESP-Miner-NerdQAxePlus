@@ -31,7 +31,7 @@ class Writer<TDestination, enable_if_t<is_std_string<TDestination>::value>> {
   }
 
   size_t write(const uint8_t* s, size_t n) {
-    str_->append(reinterpret_cast<const char*>(s), n);
+    str_->append(reinterpret_cast<const char*>(s), static_cast<typename TDestination::size_type>(n));
     return n;
   }
 
