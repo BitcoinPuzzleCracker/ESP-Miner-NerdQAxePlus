@@ -98,10 +98,11 @@ void PowerManagementTask::checkVrFrequencyChanged()
     static uint32_t lastVrFrequency = 0;
 
     // =========================================================================
-    // AANPASSING: 35.000 Hz. Samen met de 1000ms Job Interval geeft dit
-    // de perfecte balans voor 12.9 TH/s én de 0x3xxxxxxx rolling.
+    // AANPASSING: 50.000 Hz
+    // Samen met 1000ms Job Interval bereikt de teller ~50.000 stappen/sec,
+    // wat ruim voldoende is voor de 0x34 t/m 0x38 range.
     // =========================================================================
-    uint32_t vrFrequency = 35000; 
+    uint32_t vrFrequency = 50000;
 
     if (vrFrequency != lastVrFrequency) {
         m_board->setVrFrequency(vrFrequency);
