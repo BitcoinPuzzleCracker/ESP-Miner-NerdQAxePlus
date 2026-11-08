@@ -25,7 +25,6 @@ static const char *TAG = "create_jobs_task";
 
 pthread_mutex_t job_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
-
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 #define EXTRANONCE2_MAX_BYTES 8
@@ -39,27 +38,13 @@ pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 #endif
 
 static const uint64_t E2_TEST_VECTORS[] = {
-    0x0000000000001000ULL,
-    0x0000000000001001ULL,
-    0x0000000000001002ULL,
-    0x0000000000001003ULL,
-    0x0000000000001010ULL,
-    0x0000000000001020ULL,
-    0x0000000000001022ULL,
-    0x0000000000001064ULL,
-    0x00000000000010FFULL,
-    0x0000000000001100ULL,
-    0x0000000000001FFFULL,
-    0x000000000000FFFFULL,
-    0x0000000000010000ULL,
-    0x00000000FFFFFFFFULL,
-    0x0000000100000000ULL,
-    0x0000000100000001ULL,
-    0x0123456789ABCDEFULL,
-    0x7FFFFFFFFFFFFFFFULL,
-    0x8000000000000000ULL,
-    0xFFFFFFFFFFFFFF00ULL,
-    0xFFFFFFFFFFFFFFFEULL,
+    0x0000000000001000ULL, 0x0000000000001001ULL, 0x0000000000001002ULL,
+    0x0000000000001003ULL, 0x0000000000001010ULL, 0x0000000000001020ULL,
+    0x0000000000001022ULL, 0x0000000000001064ULL, 0x00000000000010FFULL,
+    0x0000000000001100ULL, 0x0000000000001FFFULL, 0x000000000000FFFFULL,
+    0x0000000000010000ULL, 0x00000000FFFFFFFFULL, 0x0000000100000000ULL,
+    0x0000000100000001ULL, 0x0123456789ABCDEFULL, 0x7FFFFFFFFFFFFFFFULL,
+    0x8000000000000000ULL, 0xFFFFFFFFFFFFFF00ULL, 0xFFFFFFFFFFFFFFFEULL,
     0xFFFFFFFFFFFFFFFFULL,
 };
 #define E2_NUM_TEST_VECTORS (sizeof(E2_TEST_VECTORS) / sizeof(E2_TEST_VECTORS[0]))
@@ -159,8 +144,7 @@ static uint64_t e2_next_pool(int pool, int len_bytes)
 {
     if (pool < 0 || pool >= EXTRANONCE2_NUM_POOLS) pool = 0;
     pthread_mutex_lock(&s_e2_lock);
-    uint64_t v = e2_state_next(&s_e2_pool[pool], len_bytes, 0,
-                               pool ? "Sec" : "Pri");
+    uint64_t v = e2_state_next(&s_e2_pool[pool], len_bytes, 0, pool ? "Sec" : "Pri");
     pthread_mutex_unlock(&s_e2_lock);
     return v;
 }
@@ -191,10 +175,7 @@ class MiningInfoV1 : public MiningInfoBase {
     uint32_t version_mask = 0;
 
   public:
-    MiningInfoV1()
-    {
-        current_job = (mining_notify *) CALLOC(1, sizeof(mining_notify));
-    }
+    MiningInfoV1() { current_job = (mining_notify *) CALLOC(1, sizeof(mining_notify)); }
 
     ~MiningInfoV1() override
     {
@@ -211,16 +192,14 @@ class MiningInfoV1 : public MiningInfoBase {
     bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
         char extranonce_2_str[extranonce_2_len * 2 + 1];
-        snprintf(extranonce_2_str, sizeof(extranonce_2_str),
-                 "%0*llx", (int) extranonce_2_len * 2,
-                 (unsigned long long) extranonce_2);
+        snprintf(extranonce_2_str, sizeof(extranonce_2_str), "%0*llx",
+                 (int) extranonce_2_len * 2, (unsigned long long) extranonce_2);
 
         int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) +
                               strlen(extranonce_2_str) + strlen(current_job->coinbase_2);
         char *coinbase_tx = (char *) MALLOC(coinbase_tx_len + 1);
         snprintf(coinbase_tx, coinbase_tx_len + 1, "%s%s%s%s",
-                 current_job->coinbase_1, extranonce_str,
-                 extranonce_2_str, current_job->coinbase_2);
+                 current_job->coinbase_1, extranonce_str, extranonce_2_str, current_job->coinbase_2);
 
         char merkle_root[65];
         calculate_merkle_root_hash(coinbase_tx, current_job->_merkle_branches,
@@ -234,22 +213,16 @@ class MiningInfoV1 : public MiningInfoBase {
         next_job->pool_diff = active_stratum_difficulty;
         next_job->pool_id = pool_id;
         next_job->asic_diff = asic_diff;
-
         return next_job;
     }
 
-    bool isValid() const override
-    {
+    bool isValid() const override {
         return current_job->ntime != 0 && extranonce_str && current_job->job_id &&
                current_job->coinbase_1 && current_job->coinbase_2;
     }
 
-    bool isNewWork(uint32_t &last_ntime) const override
-    {
-        if (last_ntime != current_job->ntime) {
-            last_ntime = current_job->ntime;
-            return true;
-        }
+    bool isNewWork(uint32_t &last_ntime) const override {
+        if (last_ntime != current_job->ntime) { last_ntime = current_job->ntime; return true; }
         return false;
     }
 
@@ -257,8 +230,7 @@ class MiningInfoV1 : public MiningInfoBase {
     uint32_t getActiveDifficulty() const override { return active_stratum_difficulty; }
     uint32_t getVersionMask() const override { return version_mask; }
 
-    void invalidate() override
-    {
+    void invalidate() override {
         current_job->ntime = 0;
         safe_free(extranonce_str);
         safe_free(next_extranonce_str);
@@ -268,26 +240,15 @@ class MiningInfoV1 : public MiningInfoBase {
     }
 
     void set_version_mask(uint32_t mask) { version_mask = mask; }
-
-    bool set_difficulty(uint32_t difficulty)
-    {
+    bool set_difficulty(uint32_t difficulty) {
         bool is_new = stratum_difficulty != difficulty;
-        stratum_difficulty = difficulty;
-        return is_new;
+        stratum_difficulty = difficulty; return is_new;
     }
-
-    void set_enonce(char *enonce, int enonce2_len)
-    {
-        safe_free(extranonce_str);
-        extranonce_str = strdup(enonce);
-        extranonce_2_len = enonce2_len;
+    void set_enonce(char *enonce, int enonce2_len) {
+        safe_free(extranonce_str); extranonce_str = strdup(enonce); extranonce_2_len = enonce2_len;
     }
-
-    void set_next_enonce(char *enonce, int enonce2_len)
-    {
-        safe_free(next_extranonce_str);
-        next_extranonce_str = strdup(enonce);
-        next_extranonce_2_len = enonce2_len;
+    void set_next_enonce(char *enonce, int enonce2_len) {
+        safe_free(next_extranonce_str); next_extranonce_str = strdup(enonce); next_extranonce_2_len = enonce2_len;
     }
 
     void create_job_mining_notify(mining_notify *notify)
@@ -299,16 +260,13 @@ class MiningInfoV1 : public MiningInfoBase {
             safe_free(next_extranonce_str);
             next_extranonce_2_len = 0;
         }
-
         safe_free(current_job->job_id);
         safe_free(current_job->coinbase_1);
         safe_free(current_job->coinbase_2);
-
         memcpy(current_job, notify, sizeof(mining_notify));
         current_job->job_id    = strdup(notify->job_id);
         current_job->coinbase_1 = strdup(notify->coinbase_1);
         current_job->coinbase_2 = strdup(notify->coinbase_2);
-
         active_stratum_difficulty = stratum_difficulty;
     }
 };
@@ -342,37 +300,24 @@ static MiningInfoV1* ensureV1(int pool)
     return &s_miningInfoV1[pool];
 }
 
-void create_job_set_version_mask(int pool, uint32_t mask)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    ensureV1(pool)->set_version_mask(mask);
+void create_job_set_version_mask(int pool, uint32_t mask) {
+    PThreadGuard g(current_stratum_job_mutex); ensureV1(pool)->set_version_mask(mask);
 }
-
-bool create_job_set_difficulty(int pool, uint32_t difficulty)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    return ensureV1(pool)->set_difficulty(difficulty);
+bool create_job_set_difficulty(int pool, uint32_t difficulty) {
+    PThreadGuard g(current_stratum_job_mutex); return ensureV1(pool)->set_difficulty(difficulty);
 }
-
-void create_job_set_enonce(int pool, char *enonce, int enonce2_len)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    ensureV1(pool)->set_enonce(enonce, enonce2_len);
+void create_job_set_enonce(int pool, char *enonce, int enonce2_len) {
+    PThreadGuard g(current_stratum_job_mutex); ensureV1(pool)->set_enonce(enonce, enonce2_len);
 }
-
-void set_next_enonce(int pool, char *enonce, int enonce2_len)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    ensureV1(pool)->set_next_enonce(enonce, enonce2_len);
+void set_next_enonce(int pool, char *enonce, int enonce2_len) {
+    PThreadGuard g(current_stratum_job_mutex); ensureV1(pool)->set_next_enonce(enonce, enonce2_len);
 }
 
 void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
 {
     {
         PThreadGuard g(current_stratum_job_mutex);
-        if (abandonWork) {
-            asicJobs.cleanJobs(pool);
-        }
+        if (abandonWork) asicJobs.cleanJobs(pool);
         ensureV1(pool)->create_job_mining_notify(notify);
     }
     trigger_job_creation();
@@ -391,32 +336,19 @@ void create_jobs_task(void *pvParameters)
     Asic *asics = board->getAsics();
 
     int forcedJobInterval = 1000;
-
     ESP_LOGI(TAG, "ASIC Job Interval: %d ms", forcedJobInterval);
     SYSTEM_MODULE.notifyMiningStarted();
     ESP_LOGI(TAG, "ASIC Ready!");
 
-    TimerHandle_t job_timer = xTimerCreate(TAG,
-        pdMS_TO_TICKS(forcedJobInterval), pdTRUE, NULL, create_job_timer);
-
-    if (job_timer == NULL) {
-        ESP_LOGE(TAG, "Failed to create timer");
-        return;
-    }
-
-    if (xTimerStart(job_timer, 0) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to start timer");
-        return;
-    }
+    TimerHandle_t job_timer = xTimerCreate(TAG, pdMS_TO_TICKS(forcedJobInterval), pdTRUE, NULL, create_job_timer);
+    if (job_timer == NULL) { ESP_LOGE(TAG, "Failed to create timer"); return; }
+    if (xTimerStart(job_timer, 0) != pdPASS) { ESP_LOGE(TAG, "Failed to start timer"); return; }
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
 
     while (1) {
-        if (POWER_MANAGEMENT_MODULE.isShutdown()) {
-            ESP_LOGW(TAG, "suspended");
-            vTaskSuspend(NULL);
-        }
+        if (POWER_MANAGEMENT_MODULE.isShutdown()) { ESP_LOGW(TAG, "suspended"); vTaskSuspend(NULL); }
         pthread_mutex_lock(&job_mutex);
         pthread_cond_wait(&job_cond, &job_mutex);
         pthread_mutex_unlock(&job_mutex);
@@ -425,9 +357,7 @@ void create_jobs_task(void *pvParameters)
         int active_pool = 0;
         const char *active_pool_str = "";
 
-        if (!STRATUM_MANAGER) {
-            continue;
-        }
+        if (!STRATUM_MANAGER) continue;
 
         active_pool = STRATUM_MANAGER->getNextActivePool();
         active_pool_str = active_pool ? "Sec" : "Pri";
@@ -441,28 +371,17 @@ void create_jobs_task(void *pvParameters)
 
         {
             PThreadGuard g(current_stratum_job_mutex);
-
             MiningInfoBase *mi = miningInfo[active_pool];
-
-            if (!mi->isValid() || !asics) {
-                continue;
-            }
+            if (!mi->isValid() || !asics) continue;
 
             if (mi->isNewWork(last_ntime[active_pool])) {
-                ESP_LOGI(TAG, "(%s) New Work Received %s",
-                         active_pool_str, mi->getJobId());
+                ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
             uint64_t e2 = e2_next_pool(active_pool, e2_len);
-
-            uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(
-                                     active_pool, mi->getActiveDifficulty());
-
+            uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
             next_job = mi->buildBmJob(e2, active_pool, asic_diff);
-
-            ESP_LOGI(TAG, "(%s) e2=%0*llx",
-                     active_pool_str, e2_len * 2,
-                     (unsigned long long) e2);
+            ESP_LOGI(TAG, "(%s) e2=%0*llx", active_pool_str, e2_len * 2, (unsigned long long) e2);
         }
 
         asics->setJobDifficultyMask(next_job->asic_diff);
@@ -475,28 +394,21 @@ void create_jobs_task(void *pvParameters)
         last_submit_time = current_time;
 
         int asic_job_id = asics->sendWork(0, next_job);
-
-        ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X",
-                 active_pool_str, active_pool, asic_job_id);
-
+        ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X", active_pool_str, active_pool, asic_job_id);
         asicJobs.storeJob(next_job, asic_job_id);
 
         for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
             if (!can_master_is_slave_active(slave)) continue;
-
             uint64_t e2 = e2_next_slave(slave, e2_len);
-
             bm_job *slave_job = nullptr;
             {
                 PThreadGuard g(current_stratum_job_mutex);
                 MiningInfoBase *mi = miningInfo[active_pool];
                 if (mi->isValid()) {
-                    uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(
-                                             active_pool, mi->getActiveDifficulty());
+                    uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
                     slave_job = mi->buildBmJob(e2, active_pool, asic_diff);
                 }
             }
-
             if (slave_job) {
                 can_send_raw_job(slave, (uint8_t) asic_job_id, slave_job);
                 slaveAsicJobs[slave].storeJob(slave_job, asic_job_id);
