@@ -1,4 +1,4 @@
-#include <algorithm>
+q#include <algorithm>
 #include <math.h>
 
 #include "esp_log.h"
@@ -83,16 +83,17 @@ void PowerManagementTask::checkAsicFrequencyChanged()
 
 void PowerManagementTask::checkVrFrequencyChanged()
 {
-    static uint32_t lastVrFrequency = 0;
+    // =====================================================================
+    // VARIANT B: version rolling UIT (0 Hz)
+    // lastVrFrequency start op 0xFFFFFFFF zodat de eerste call altijd vuurt.
+    // =====================================================================
+    static uint32_t lastVrFrequency = 0xFFFFFFFF;
 
-    // =====================================================================
-    // VARIANT A: 35.000 Hz rolling
-    // =====================================================================
-    uint32_t vrFrequency = 35000;
+    uint32_t vrFrequency = 0;
 
     if (vrFrequency != lastVrFrequency) {
         m_board->setVrFrequency(vrFrequency);
-        ESP_LOGI(TAG, "setting version rolling frequency to %luHz", vrFrequency);
+        ESP_LOGI(TAG, "setting version rolling frequency to %luHz (DISABLED)", vrFrequency);
         lastVrFrequency = vrFrequency;
     }
 }
