@@ -31,39 +31,9 @@ jobs:
           - board: NERDQAXEPLUS
             upload_www: true
             label: NerdQAxe+
-          - board: NERDOCTAXEPLUS
-            upload_www: false
-            label: NerdOCTAXE+
           - board: NERDQAXEPLUS2
             upload_www: false
             label: NerdQAxe++
-          - board: NERDAXE
-            upload_www: false
-            label: NerdAxe
-          - board: NERDOCTAXEGAMMA
-            upload_www: false
-            label: NerdOCTAXE-Gamma
-          - board: NERDAXEGAMMA
-            upload_www: false
-            label: NerdAxeGamma
-          - board: NERDAXEGAIA
-            upload_www: false
-            label: NerdAxeGaia
-          - board: NERDHAXEGAMMA
-            upload_www: false
-            label: NerdHaxe-Gamma
-          - board: NERDEKO
-            upload_www: false
-            label: NerdEKO
-          - board: NERDQX
-            upload_www: false
-            label: NerdQX
-          - board: Q1370
-            upload_www: false
-            label: Q1370
-          - board: Q1373
-            upload_www: false
-            label: Q1373
 
     steps:
     - name: Checkout repository
