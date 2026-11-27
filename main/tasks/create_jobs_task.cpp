@@ -27,9 +27,13 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-// Vlag om version/nonce rolling te resetten zodra er nieuwe blokgegevens binnenkomen
+// Rolling state voor version en nonce-stap (zonder extranonce2-variatie: extranonce2 blijft 0)
 static volatile bool g_reset_rolling_on_new_block = true;
 static uint32_t g_roll_step = 0;
+static uint32_t g_nonce_roll = 0;
+static uint32_t g_last_version_mask = 0;
+static uint32_t g_last_nonce_roll = 0;
+static bool g_has_prev_roll_state = false;
 
 // ============================================================================
 // MiningInfoBase - abstract interface for protocol-agnostic job construction
@@ -74,28 +78,60 @@ class MiningInfoV1 : public MiningInfoBase {
         }
     }
 
-    // Past een rolling-stap toe binnen de door de pool toegestane version-bits
+    // Berekent het volgende version_mask binnen de door de pool toegestane bits
     uint32_t compute_rolled_version_mask(uint32_t base_mask, uint32_t step) const
     {
         if (base_mask == 0) {
             return 0;
         }
-        // Gebruik een stap in de rolling-bits (BIP320 version bits liggen in 0x1fffe000)
-        uint32_t roll_bits = ((step * 0x2000U) & 0x1fffe000U);
-        uint32_t effective = (base_mask ^ roll_bits) & base_mask;
-        return (effective != 0) ? effective : base_mask;
+        uint32_t allowed = base_mask & 0x1fffe000U;
+        if (allowed == 0) {
+            return base_mask;
+        }
+        // Schuif rollende bits over de toegestane BIP320-bits
+        uint32_t raw_shift = (step * 0x2000U) & 0x1fffe000U;
+        uint32_t rolled = (allowed ^ raw_shift) & allowed;
+        return (rolled != 0) ? rolled : allowed;
     }
 
-    void reset_version_rolling()
+    // Berekent een rolling nonce-offset (Golden Ratio 32-bit stap)
+    uint32_t compute_rolled_nonce_offset(uint32_t step) const
     {
-        g_roll_step = 0;
-        version_mask = compute_rolled_version_mask(pool_version_mask, g_roll_step);
+        return (step * 0x9E3779B9U) & 0xFFFFFFFFU;
     }
 
-    void step_version_rolling()
+    // Loop: checken -> rollen -> checken -> rollen tot we een verse combinatie hebben
+    void advance_version_and_nonce_rolling(bool reset_first)
     {
-        g_roll_step++;
-        version_mask = compute_rolled_version_mask(pool_version_mask, g_roll_step);
+        if (reset_first) {
+            g_roll_step = 0;
+            g_nonce_roll = 0;
+            g_has_prev_roll_state = false;
+        } else {
+            g_roll_step++;
+            g_nonce_roll = compute_rolled_nonce_offset(g_roll_step);
+        }
+
+        uint32_t candidate_ver = compute_rolled_version_mask(pool_version_mask, g_roll_step);
+        uint32_t candidate_nonce = g_nonce_roll;
+
+        // Check -> rol -> check -> rol (max 16 pogingen per tick om vastlopen te voorkomen)
+        int guard = 0;
+        while (g_has_prev_roll_state &&
+               candidate_ver == g_last_version_mask &&
+               candidate_nonce == g_last_nonce_roll &&
+               guard < 16) {
+            g_roll_step++;
+            candidate_nonce = compute_rolled_nonce_offset(g_roll_step);
+            candidate_ver = compute_rolled_version_mask(pool_version_mask, g_roll_step);
+            guard++;
+        }
+
+        version_mask = candidate_ver;
+        g_nonce_roll = candidate_nonce;
+        g_last_version_mask = version_mask;
+        g_last_nonce_roll = g_nonce_roll;
+        g_has_prev_roll_state = true;
     }
 
     bm_job* buildBmJob64(uint64_t extranonce_2, int pool_id, uint32_t asic_diff)
@@ -243,7 +279,7 @@ class MiningInfoV1 : public MiningInfoBase {
 
         if (job_changed) {
             g_reset_rolling_on_new_block = true;
-            reset_version_rolling();
+            advance_version_and_nonce_rolling(true);
         }
     }
 };
@@ -404,11 +440,8 @@ void create_jobs_task(void *pvParameters)
             g_reset_rolling_on_new_block = false;
 
             if (mi == &s_miningInfoV1[active_pool]) {
-                if (do_reset) {
-                    s_miningInfoV1[active_pool].reset_version_rolling();
-                } else {
-                    s_miningInfoV1[active_pool].step_version_rolling();
-                }
+                // Check -> rol -> check -> rol bij elke job-cyclus (en reset bij nieuw blok)
+                s_miningInfoV1[active_pool].advance_version_and_nonce_rolling(do_reset);
                 int allowed_len = s_miningInfoV1[active_pool].extranonce_2_len;
                 extranonce_2 = get_next_custom_extranonce2(allowed_len, do_reset);
                 uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
