@@ -71,7 +71,7 @@ class MiningInfoV1 : public MiningInfoBase {
 
     // --- MiningInfoBase interface ---
 
-    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
+    bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
         // the parser only accepts 1..MAX_EXTRANONCE_2_LEN, never size a stack buffer from the pool
         if (extranonce_2_len < 1 || extranonce_2_len > MAX_EXTRANONCE_2_LEN) {
@@ -79,10 +79,10 @@ class MiningInfoV1 : public MiningInfoBase {
             return nullptr;
         }
 
-        // generate extranonce2 hex string (64-bit ondersteuning)
+        // generate extranonce2 hex string
         char extranonce_2_str[MAX_EXTRANONCE_2_LEN * 2 + 1]; // +1 zero termination
-        snprintf(extranonce_2_str, extranonce_2_len * 2 + 1, "%0*llx", (int) extranonce_2_len * 2,
-                 (unsigned long long) extranonce_2);
+        snprintf(extranonce_2_str, extranonce_2_len * 2 + 1, "%0*lx", (int) extranonce_2_len * 2,
+                 (unsigned long) extranonce_2);
 
         // generate coinbase tx
         int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) + strlen(extranonce_2_str) +
@@ -283,16 +283,16 @@ void create_job_invalidate(int pool)
 
 // Genereert een random extranonce2 met oplopend aantal hex-cijfers (startend bij 4),
 // aangevuld met nullen, en test elke waarde eerst rechts en daarna links uitgelijnd.
-static uint64_t get_next_custom_extranonce2(int extranonce_2_len)
+static uint32_t get_next_custom_extranonce2(int extranonce_2_len)
 {
     int max_hex_digits = extranonce_2_len * 2;
-    if (max_hex_digits > 16) max_hex_digits = 16;
+    if (max_hex_digits > 8) max_hex_digits = 8; // Past binnen uint32_t (8 hex-cijfers)
     if (max_hex_digits < 1) return 0;
 
     int start_digits = (max_hex_digits >= 4) ? 4 : 1;
 
     static int current_digits = 4;
-    static uint64_t current_rand_val = 0;
+    static uint32_t current_rand_val = 0;
     static bool send_left_aligned = false;
 
     if (current_digits > max_hex_digits || current_digits < start_digits) {
@@ -300,23 +300,23 @@ static uint64_t get_next_custom_extranonce2(int extranonce_2_len)
         send_left_aligned = false;
     }
 
-    uint64_t result = 0;
+    uint32_t result = 0;
 
     if (!send_left_aligned) {
-        uint64_t r = ((uint64_t) esp_random() << 32) | esp_random();
-        uint64_t mask = (current_digits == 16) ? UINT64_MAX : ((1ULL << (current_digits * 4)) - 1);
+        uint32_t r = esp_random();
+        uint32_t mask = (current_digits == 8) ? UINT32_MAX : ((1UL << (current_digits * 4)) - 1);
         current_rand_val = r & mask;
 
-        uint64_t min_val = 1ULL << ((current_digits - 1) * 4);
+        uint32_t min_val = 1UL << ((current_digits - 1) * 4);
         if (current_rand_val < min_val) {
             current_rand_val |= min_val;
         }
 
-        // Rechts uitgelijnd (bijv. 0000000000003951)
+        // Rechts uitgelijnd (bijv. 00003951)
         result = current_rand_val;
         send_left_aligned = true;
     } else {
-        // Links uitgelijnd (bijv. 3951000000000000)
+        // Links uitgelijnd (bijv. 39510000)
         int shift_bits = (max_hex_digits - current_digits) * 4;
         result = current_rand_val << shift_bits;
 
@@ -353,7 +353,7 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
-    uint64_t extranonce_2 = 0;
+    uint32_t extranonce_2 = 0;
 
     // CAN: per-slave rolling counters (upper 7 bits = slave_id, lower 25 = counter)
     uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
