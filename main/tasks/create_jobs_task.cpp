@@ -282,10 +282,11 @@ void create_job_invalidate(int pool)
     asicJobs.cleanJobs(pool);
 }
 
-// Genereert een willekeurige extranonce2 met oplopend aantal hex-cijfers (startend bij 4):
+// Genereert stap voor stap (4, 5, 6, 7, ... -> max_hex_digits) een willekeurige
+// extranonce2 met exact `current_digits` hex-cijfers:
 // 1) eerst rechts uitgelijnd (bijv. 0000000000003951)
-// 2) direct daarna naar links verschoven binnen max_hex_digits (bijv. 3951000000000000)
-// Daarna gaat het aantal hex-cijfers omhoog (4 -> 5 -> 6 -> ... -> max_hex_digits) en herhaalt zich.
+// 2) direct daarna dezelfde waarde links uitgelijnd (bijv. 3951000000000000)
+// Daarna gaat `current_digits` met 1 omhoog tot `max_hex_digits` en herhaalt de cyclus.
 static uint64_t get_next_custom_extranonce2(int extranonce_2_len)
 {
     int max_hex_digits = extranonce_2_len * 2;
@@ -309,16 +310,13 @@ static uint64_t get_next_custom_extranonce2(int extranonce_2_len)
 
     if (!send_shifted_left) {
         uint64_t r = ((uint64_t) esp_random() << 32) | (uint64_t) esp_random();
-        uint64_t mask = (current_digits == 16)
-                            ? UINT64_MAX
-                            : ((1ULL << (current_digits * 4)) - 1ULL);
-        uint64_t min_val = (current_digits == 1)
-                               ? 0ULL
-                               : (1ULL << ((current_digits - 1) * 4));
 
-        current_rand_val = r & mask;
-        if (current_rand_val < min_val) {
-            current_rand_val |= min_val;
+        if (current_digits == 16) {
+            current_rand_val = r;
+        } else {
+            uint64_t min_val = (current_digits == 1) ? 0ULL : (1ULL << ((current_digits - 1) * 4));
+            uint64_t span = (1ULL << (current_digits * 4)) - min_val;
+            current_rand_val = min_val + (r % span);
         }
 
         // Als current_digits gelijk is aan max_hex_digits (bijv. 16), is links en rechts gelijk;
