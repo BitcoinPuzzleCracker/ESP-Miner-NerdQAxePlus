@@ -1,427 +1,222 @@
-#include <limits.h>
-#include <pthread.h>
-#include <string.h>
-#include <sys/time.h>
-
-#include "esp_log.h"
-#include "esp_system.h"
-#include "esp_timer.h"
-#include "mining.h"
-
-#include "global_state.h"
-#include "create_jobs_task.h"
-#include "can_sender.h"
-#include "can_master_task.h"
-
-#include "boards/board.h"
-#include "macros.h"
-#include "system.h"
-
-#define PRIMARY 0
-#define SECONDARY 1
-
-static const char *TAG = "create_jobs_task";
-
-pthread_mutex_t job_mutex = PTHREAD_MUTEX_INITIALIZER;
-pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
-
-pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
-
 // ============================================================================
-// MiningInfoBase - abstract interface for protocol-agnostic job construction
+//  extranonce2_test.cpp
+//  Standalone test for random extranonce2 generation scheme.
+//
+//  Scheme:
+//    - start at MIN_HEX_DIGITS significant hex digits (default 4)
+//    - generate a random value limited to N significant hex digits
+//    - emit TRAILING  (right-aligned, zero-pad left)
+//    - emit LEADING   (left-aligned,  zero-pad right, SAME random value)
+//    - N++ ; repeat until N > max_hex (= extranonce_2_len * 2)
+//    - wrap back to MIN_HEX_DIGITS
+//    - on pool switch (extranonce_2_len change) : state RESETS
+//
+//  Compile:   g++ -O2 -Wall -o test extranonce2_test.cpp
+//  Run:       ./test
 // ============================================================================
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
 
-MiningInfoBase::~MiningInfoBase() {}
+// -------- CONFIG -------------------------------------------------------------
+static constexpr int  MIN_HEX_DIGITS                 = 4;   // start met 4 significante hex-cijfers
+static constexpr int  RANDOMS_PER_SIZE               = 1;   // random waarden per cijfer-grootte
+static constexpr bool SKIP_DUPLICATE_AT_FULL_WIDTH   = false; // true = geen 2e emit bij volle breedte
 
-// ============================================================================
-// MiningInfoV1 - Stratum V1 job construction
-// ============================================================================
+// -------- DETERMINISTIC RNG (vervang door esp_random() op ESP32) ------------
+static uint64_t g_rng_state = 0x123456789ABCDEFULL;
+static uint32_t fake_esp_random() {
+    g_rng_state ^= g_rng_state << 13;
+    g_rng_state ^= g_rng_state >> 7;
+    g_rng_state ^= g_rng_state << 17;
+    return (uint32_t)(g_rng_state >> 16);
+}
+static uint64_t fake_esp_random64() {
+    return ((uint64_t)fake_esp_random() << 32) | fake_esp_random();
+}
 
-class MiningInfoV1 : public MiningInfoBase {
-  public:
-    mining_notify *current_job = nullptr;
-
-    char *extranonce_str = nullptr;
-    int extranonce_2_len = 0;
-
-    char *next_extranonce_str = nullptr;
-    int next_extranonce_2_len = 0;
-
-    uint32_t stratum_difficulty = 8192;
-    uint32_t active_stratum_difficulty = 8192;
-    uint32_t version_mask = 0;
-
-  public:
-    MiningInfoV1()
-    {
-        current_job = (mining_notify *) CALLOC(1, sizeof(mining_notify));
-    }
-
-    ~MiningInfoV1() override
-    {
-        safe_free(extranonce_str);
-        safe_free(next_extranonce_str);
-        if (current_job) {
-            safe_free(current_job->job_id);
-            safe_free(current_job->coinbase_1);
-            safe_free(current_job->coinbase_2);
-            free(current_job);
-        }
-    }
-
-    // --- MiningInfoBase interface ---
-
-    bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
-    {
-        // the parser only accepts 1..MAX_EXTRANONCE_2_LEN, never size a stack buffer from the pool
-        if (extranonce_2_len < 1 || extranonce_2_len > MAX_EXTRANONCE_2_LEN) {
-            ESP_LOGE(TAG, "invalid extranonce2 size %d", extranonce_2_len);
-            return nullptr;
-        }
-
-        // generate extranonce2 hex string
-        char extranonce_2_str[MAX_EXTRANONCE_2_LEN * 2 + 1]; // +1 zero termination
-        snprintf(extranonce_2_str, extranonce_2_len * 2 + 1, "%0*lx", (int) extranonce_2_len * 2, (unsigned long) extranonce_2);
-
-        // generate coinbase tx
-        int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) + strlen(extranonce_2_str) +
-                              strlen(current_job->coinbase_2);
-        char *coinbase_tx = (char *) MALLOC(coinbase_tx_len + 1);
-        if (!coinbase_tx) {
-            ESP_LOGE(TAG, "no memory for coinbase tx");
-            return nullptr;
-        }
-        snprintf(coinbase_tx, coinbase_tx_len + 1, "%s%s%s%s", current_job->coinbase_1, extranonce_str,
-                 extranonce_2_str, current_job->coinbase_2);
-
-        // calculate merkle root
-        char merkle_root[65];
-        calculate_merkle_root_hash(coinbase_tx, current_job->_merkle_branches, current_job->n_merkle_branches,
-                                   merkle_root);
-        free(coinbase_tx);
-
-        // we need malloc because we will save it in the job array
-        bm_job *next_job = (bm_job *) MALLOC(sizeof(bm_job));
-        if (!next_job) {
-            ESP_LOGE(TAG, "no memory for job");
-            return nullptr;
-        }
-        construct_bm_job(current_job, merkle_root, version_mask, next_job);
-        next_job->jobid = strdup(current_job->job_id);
-        next_job->extranonce2 = strdup(extranonce_2_str);
-        next_job->pool_diff = active_stratum_difficulty;
-        next_job->pool_id = pool_id;
-        next_job->asic_diff = asic_diff;
-
-        return next_job;
-    }
-
-    bool isValid() const override
-    {
-        // a job needs both the notify and the extranonce1 from the subscribe result.
-        // After invalidate() a mining.notify can arrive without a usable subscribe
-        // result (e.g. malformed response), which would crash buildBmJob().
-        return current_job->ntime != 0 && extranonce_str && current_job->job_id && current_job->coinbase_1 &&
-               current_job->coinbase_2;
-    }
-
-    bool isNewWork(uint32_t &last_ntime) const override
-    {
-        if (last_ntime != current_job->ntime) {
-            last_ntime = current_job->ntime;
-            return true;
-        }
-        return false;
-    }
-
-    const char* getJobId() const override
-    {
-        return current_job->job_id;
-    }
-
-    uint32_t getActiveDifficulty() const override
-    {
-        return active_stratum_difficulty;
-    }
-
-    uint32_t getVersionMask() const override
-    {
-        return version_mask;
-    }
-
-    void invalidate() override
-    {
-        // mark as invalid
-        current_job->ntime = 0;
-        safe_free(extranonce_str);
-        safe_free(next_extranonce_str);
-        safe_free(current_job->job_id);
-        safe_free(current_job->coinbase_1);
-        safe_free(current_job->coinbase_2);
-    }
-
-    // --- V1-specific methods ---
-
-    void set_version_mask(uint32_t mask)
-    {
-        version_mask = mask;
-    }
-
-    bool set_difficulty(uint32_t difficulty)
-    {
-        // new difficulty?
-        bool is_new = stratum_difficulty != difficulty;
-
-        // set difficulty
-        stratum_difficulty = difficulty;
-        return is_new;
-    }
-
-    void set_enonce(char *enonce, int enonce2_len)
-    {
-        safe_free(extranonce_str);
-
-        extranonce_str = strdup(enonce);
-        extranonce_2_len = enonce2_len;
-    }
-
-    void set_next_enonce(char *enonce, int enonce2_len)
-    {
-        safe_free(next_extranonce_str);
-
-        next_extranonce_str = strdup(enonce);
-        next_extranonce_2_len = enonce2_len;
-    }
-
-    void create_job_mining_notify(mining_notify *notify)
-    {
-        // do we have a pending extranonce switch?
-        if (next_extranonce_str) {
-            safe_free(extranonce_str);
-            extranonce_str = strdup(next_extranonce_str);
-            extranonce_2_len = next_extranonce_2_len;
-            safe_free(next_extranonce_str);
-            next_extranonce_2_len = 0;
-        }
-
-        safe_free(current_job->job_id);
-        safe_free(current_job->coinbase_1);
-        safe_free(current_job->coinbase_2);
-
-        // copy trivial types
-        memcpy(current_job, notify, sizeof(mining_notify));
-        // duplicate dynamic strings with unknown length
-        current_job->job_id = strdup(notify->job_id);
-        current_job->coinbase_1 = strdup(notify->coinbase_1);
-        current_job->coinbase_2 = strdup(notify->coinbase_2);
-
-        // set active difficulty with the mining.notify command
-        active_stratum_difficulty = stratum_difficulty;
-    }
+// -------- STATE MACHINE ------------------------------------------------------
+struct EnonceRandomState {
+    int      max_hex      = 0;                 // = extranonce_2_len * 2
+    int      hex_digits   = MIN_HEX_DIGITS;    // huidige significante hex-lengte
+    int      randoms_done = 0;                 // hoeveel random waarden al bij deze size
+    bool     leading      = false;             // false = trailing, true = leading
+    uint64_t last_random  = 0;                 // zelfde random voor beide oriëntaties
 };
 
-// Global mining info instances - one per pool slot
-static MiningInfoV1 s_miningInfoV1[2] = {MiningInfoV1{}, MiningInfoV1{}};
-MiningInfoBase* miningInfo[2] = {&s_miningInfoV1[0], &s_miningInfoV1[1]};
-
-#define min(a, b) ((a < b) ? (a) : (b))
-#define max(a, b) ((a > b) ? (a) : (b))
-
-static void create_job_timer(TimerHandle_t xTimer)
-{
-    pthread_mutex_lock(&job_mutex);
-    pthread_cond_signal(&job_cond);
-    pthread_mutex_unlock(&job_mutex);
+static void enonce_state_init(EnonceRandomState &s, int extranonce_2_len) {
+    s.max_hex = extranonce_2_len * 2;
+    int start = (s.max_hex >= MIN_HEX_DIGITS) ? MIN_HEX_DIGITS : s.max_hex;
+    if (start < 1) start = 1;
+    s.hex_digits   = start;
+    s.randoms_done = 0;
+    s.leading      = false;
+    s.last_random  = 0;
 }
 
-void trigger_job_creation()
-{
-    pthread_mutex_lock(&job_mutex);
-    pthread_cond_signal(&job_cond);
-    pthread_mutex_unlock(&job_mutex);
-}
+static uint64_t next_random_extranonce2(EnonceRandomState &s) {
+    if (s.max_hex <= 0) return 0;
 
-// Ensure miningInfo[pool] points to the V1 instance.
-// Called by all V1 free functions to handle mixed-protocol fallback
-// (e.g., pool was SV2 and switched to V1 - miningInfo might still
-// point to a V2 instance from create_jobs_sv2.cpp).
-static MiningInfoV1* ensureV1(int pool)
-{
-    if (miningInfo[pool] != &s_miningInfoV1[pool]) {
-        // Reset to V1 instance (V2 instances are owned by create_jobs_sv2.cpp)
-        s_miningInfoV1[pool].invalidate();
-        miningInfo[pool] = &s_miningInfoV1[pool];
-    }
-    return &s_miningInfoV1[pool];
-}
-
-void create_job_set_version_mask(int pool, uint32_t mask)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    ensureV1(pool)->set_version_mask(mask);
-}
-
-bool create_job_set_difficulty(int pool, uint32_t difficulty)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    return ensureV1(pool)->set_difficulty(difficulty);
-}
-
-void create_job_set_enonce(int pool, char *enonce, int enonce2_len)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    ensureV1(pool)->set_enonce(enonce, enonce2_len);
-}
-
-void set_next_enonce(int pool, char *enonce, int enonce2_len)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    ensureV1(pool)->set_next_enonce(enonce, enonce2_len);
-}
-
-void create_job_mining_notify(int pool, mining_notify *notify, bool abandonWork)
-{
-    {
-        PThreadGuard g(current_stratum_job_mutex);
-        // clear jobs for pool
-        if (abandonWork) {
-            asicJobs.cleanJobs(pool);
-        }
-        ensureV1(pool)->create_job_mining_notify(notify);
-    }
-    trigger_job_creation();
-}
-
-void create_job_invalidate(int pool)
-{
-    PThreadGuard g(current_stratum_job_mutex);
-    miningInfo[pool]->invalidate();
-    asicJobs.cleanJobs(pool);
-}
-
-void create_jobs_task(void *pvParameters)
-{
-    Board *board = SYSTEM_MODULE.getBoard();
-    Asic *asics = board->getAsics();
-
-    ESP_LOGI(TAG, "ASIC Job Interval: %d ms", board->getAsicJobIntervalMs());
-    SYSTEM_MODULE.notifyMiningStarted();
-    ESP_LOGI(TAG, "ASIC Ready!");
-
-    // Create the timer
-    TimerHandle_t job_timer = xTimerCreate(TAG, pdMS_TO_TICKS(board->getAsicJobIntervalMs()), pdTRUE, NULL, create_job_timer);
-
-    if (job_timer == NULL) {
-        ESP_LOGE(TAG, "Failed to create timer");
-        return;
+    // veiligheids-clamps (pool met te kleine / ontbrekende enonce)
+    if (s.hex_digits < 1) s.hex_digits = 1;
+    if (s.hex_digits > s.max_hex) {
+        int start = (s.max_hex >= MIN_HEX_DIGITS) ? MIN_HEX_DIGITS : s.max_hex;
+        if (start < 1) start = 1;
+        s.hex_digits   = start;
+        s.randoms_done = 0;
+        s.leading      = false;
     }
 
-    // Start the timer
-    if (xTimerStart(job_timer, 0) != pdPASS) {
-        ESP_LOGE(TAG, "Failed to start timer");
-        return;
+    int      digits = s.hex_digits;
+    uint64_t value;
+
+    if (!s.leading) {
+        // (1) nieuwe random, beperkt tot 'digits' hex-cijfers
+        uint64_t mask = (digits >= 16) ? ~0ULL : ((1ULL << (digits * 4)) - 1);
+        s.last_random = fake_esp_random64() & mask;
+        value = s.last_random;             // trailing: right-aligned
+        s.leading = true;
+
+        if (SKIP_DUPLICATE_AT_FULL_WIDTH && digits == s.max_hex) {
+            s.leading = false;
+            s.randoms_done++;
+            if (s.randoms_done >= RANDOMS_PER_SIZE) { s.hex_digits++; s.randoms_done = 0; }
+        }
+    } else {
+        // (2) zelfde random, leading-shifted
+        int shift = (s.max_hex - digits) * 4;
+        value = (shift >= 64) ? 0 : (s.last_random << shift);
+        s.leading = false;
+        s.randoms_done++;
+        if (s.randoms_done >= RANDOMS_PER_SIZE) {
+            s.hex_digits++;
+            s.randoms_done = 0;
+        }
     }
+    return value;
+}
 
-    uint32_t last_ntime[2]{0};
-    uint64_t last_submit_time = 0;
-    uint32_t extranonce_2 = 0;
+// -------- FORMAT -------------------------------------------------------------
+static void format_hex(char *out, size_t n, uint64_t v, int width) {
+    if (width >= 16) snprintf(out, n, "%016llx", (unsigned long long)v);
+    else             snprintf(out, n, "%0*llx",  width, (unsigned long long)v);
+}
 
-    // CAN: per-slave rolling counters (upper 7 bits = slave_id, lower 25 = counter)
-    uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
+// -------- TEST RUNNER --------------------------------------------------------
+static void run_test(int extranonce_2_len, int num_jobs) {
+    printf("\n+--------------------------------------------------------------------+\n");
+    printf("| POOL: extranonce_2_len = %d byte(s)    max_hex = %2d                |\n",
+           extranonce_2_len, extranonce_2_len * 2);
+    printf("+--------------------------------------------------------------------+\n");
+    printf(" idx | digits | orient   | %-16s | note\n", "extranonce2");
+    printf("-----+--------+----------+------------------+---------------------------------\n");
 
-    int lastJobInterval = board->getAsicJobIntervalMs();
+    EnonceRandomState s;
+    enonce_state_init(s, extranonce_2_len);
 
-    while (1) {
-        if (POWER_MANAGEMENT_MODULE.isShutdown()) {
-            ESP_LOGW(TAG, "suspended");
-            vTaskSuspend(NULL);
-        }
-        pthread_mutex_lock(&job_mutex);
-        pthread_cond_wait(&job_cond, &job_mutex); // Wait for the timer or external trigger
-        pthread_mutex_unlock(&job_mutex);
+    for (int i = 0; i < num_jobs; i++) {
+        int      d            = s.hex_digits;
+        bool     was_leading  = s.leading;
+        uint64_t v            = next_random_extranonce2(s);
+        char     buf[32];
+        format_hex(buf, sizeof(buf), v, s.max_hex);
 
-        // job interval changed via UI
-        if (board->getAsicJobIntervalMs() != lastJobInterval) {
-            xTimerChangePeriod(job_timer, pdMS_TO_TICKS(board->getAsicJobIntervalMs()), 0);
-            lastJobInterval = board->getAsicJobIntervalMs();
-            continue;
-        }
+        const char *note;
+        if (!was_leading) note = (d == s.max_hex) ? "new random | full width"
+                                                  : "new random | trailing pad";
+        else              note = (d == s.max_hex) ? "same random | full width (identical)"
+                                                  : "same random | leading pad";
 
-        bm_job *next_job = nullptr;
-        int active_pool = 0;
-        const char *active_pool_str = "";
-
-        if (!STRATUM_MANAGER) {
-            continue;
-        }
-
-        // select pool to mine for
-        active_pool = STRATUM_MANAGER->getNextActivePool();
-        active_pool_str = active_pool ? "Sec" : "Pri";
-
-        { // scope for mutex
-            PThreadGuard g(current_stratum_job_mutex);
-
-            // set current pool data
-            MiningInfoBase *mi = miningInfo[active_pool];
-
-            if (!mi->isValid() || !asics) {
-                continue;
-            }
-
-            if (mi->isNewWork(last_ntime[active_pool])) {
-                ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
-            }
-
-            uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
-            next_job = mi->buildBmJob(extranonce_2, active_pool, asic_diff);
-        } // mutex
-
-        // out of memory or invalid pool parameters, try again on the next tick
-        if (!next_job) {
-            continue;
-        }
-
-        // set asic difficulty
-        asics->setJobDifficultyMask(next_job->asic_diff);
-
-        uint64_t current_time = esp_timer_get_time();
-        if (last_submit_time) {
-            ESP_LOGD(TAG, "(%s) job interval %dms", active_pool_str, (int) ((current_time - last_submit_time) / 1e3));
-        }
-        last_submit_time = current_time;
-
-        int asic_job_id = asics->sendWork(extranonce_2, next_job);
-
-        ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X", active_pool_str, active_pool, asic_job_id);
-
-        // save job
-        asicJobs.storeJob(next_job, asic_job_id);
-
-        extranonce_2++;
-
-        // --- CAN: send raw job to each slave ---
-        for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
-            if (!can_master_is_slave_active(slave)) continue;
-            uint32_t e2 = can_make_extranonce2(slave, slave_counters[slave]++);
-
-            bm_job *slave_job = nullptr;
-            {
-                PThreadGuard g(current_stratum_job_mutex);
-                MiningInfoBase *mi = miningInfo[active_pool];
-                if (mi->isValid()) {
-                    uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
-                    slave_job = mi->buildBmJob(e2, active_pool, asic_diff);
-                }
-            }
-
-            if (slave_job) {
-                can_send_raw_job(slave, (uint8_t) asic_job_id, slave_job);
-                slaveAsicJobs[slave].storeJob(slave_job, asic_job_id);
-                // slaveAsicJobs owns slave_job now — do not free here
-            }
-        }
-
+        printf(" %3d | %6d | %-8s | %-16s | %s\n",
+               i, d, was_leading ? "leading" : "trailing", buf, note);
     }
+}
 
+// -------- WORKED EXAMPLE (exact jouw voorbeeld) ------------------------------
+static void show_worked_example() {
+    printf("\n+--------------------------------------------------------------------+\n");
+    printf("| WORKED EXAMPLE (vaste waarden, precies jouw voorbeeld)             |\n");
+    printf("| Veld = 16 hex chars (= 8-byte extranonce2)                        |\n");
+    printf("+--------------------------------------------------------------------+\n");
+
+    const int max_hex = 16;
+    struct { int digits; uint64_t val; } cases[] = {
+        {4,  0x3951ULL},
+        {5,  0x04A2BULL},
+        {6,  0x12CDEFULL},
+        {7,  0x0AABBCCULL},
+        {8,  0xDEADBEEFULL},
+        {16, 0x123456789ABCDEF0ULL},
+    };
+    for (auto &c : cases) {
+        int      shift    = (max_hex - c.digits) * 4;
+        uint64_t trailing = c.val;
+        uint64_t leading  = (shift >= 64) ? 0 : (c.val << shift);
+        char     tbuf[32], lbuf[32];
+        format_hex(tbuf, sizeof(tbuf), trailing, max_hex);
+        format_hex(lbuf, sizeof(lbuf), leading,  max_hex);
+        printf("\n  digits = %2d , random = 0x%llx\n",
+               c.digits, (unsigned long long)c.val);
+        printf("    TRAILING -> %s\n", tbuf);
+        printf("    LEADING  -> %s%s\n", lbuf,
+               (trailing == leading) ? "   (identiek: volle breedte)" : "");
+    }
+}
+
+// -------- POOL SWITCH TEST ---------------------------------------------------
+static EnonceRandomState g_pools[4];
+static int              g_pool_len[4] = {-1, -1, -1, -1};
+
+static uint64_t pool_next(int pool, int pool_len) {
+    if (g_pool_len[pool] != pool_len) {
+        printf("  [pool %d: extranonce_2_len %d -> %d, state RESET]\n",
+               pool, g_pool_len[pool], pool_len);
+        enonce_state_init(g_pools[pool], pool_len);
+        g_pool_len[pool] = pool_len;
+    }
+    return next_random_extranonce2(g_pools[pool]);
+}
+
+static void run_pool_switch_test() {
+    printf("\n+--------------------------------------------------------------------+\n");
+    printf("| POOL SWITCHING TEST (failover simulatie)                          |\n");
+    printf("| pools: 0 = 8-byte, 1 = 4-byte, 2 = 2-byte                        |\n");
+    printf("+--------------------------------------------------------------------+\n\n");
+
+    struct { int pool; int len; } seq[] = {
+        {0,8},{0,8},{0,8},
+        {1,4},{1,4},{1,4},
+        {2,2},{2,2},{2,2},
+        {0,8},{0,8},   // terug naar pool 0 -> gaat verder waar hij was
+        {1,4},{1,4},
+    };
+    for (auto &e : seq) {
+        uint64_t v = pool_next(e.pool, e.len);
+        char     buf[32];
+        format_hex(buf, sizeof(buf), v, e.len * 2);
+        printf("pool %d (len=%d) -> %s\n", e.pool, e.len, buf);
+    }
+}
+
+int main() {
+    printf("======================================================================\n");
+    printf(" EXTRANONCE2 RANDOM GENERATOR -- TEST HARNESS\n");
+    printf("======================================================================\n");
+    printf(" MIN_HEX_DIGITS   = %d\n", MIN_HEX_DIGITS);
+    printf(" RANDOMS_PER_SIZE = %d\n", RANDOMS_PER_SIZE);
+    printf(" SKIP_DUPLICATE_AT_FULL_WIDTH = %s\n",
+           SKIP_DUPLICATE_AT_FULL_WIDTH ? "true" : "false");
+
+    show_worked_example();
+
+    run_test(2, 12);   // 2-byte pool -> max_hex = 4
+    run_test(3, 20);   // 3-byte pool -> max_hex = 6
+    run_test(4, 20);   // 4-byte pool -> max_hex = 8   (uint32_t grens op ESP32)
+    run_test(8, 30);   // 8-byte pool -> max_hex = 16  (vereist uint64_t refactor)
+
+    run_pool_switch_test();
+
+    printf("\n======================================================================\n");
+    return 0;
 }
