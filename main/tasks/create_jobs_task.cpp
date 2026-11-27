@@ -6,7 +6,6 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"
-#include "esp_random.h"  // <-- NIEUW: voor esp_random()
 #include "mining.h"
 
 #include "global_state.h"
@@ -17,7 +16,6 @@
 #include "boards/board.h"
 #include "macros.h"
 #include "system.h"
-#include "guards.h"
 
 #define PRIMARY 0
 #define SECONDARY 1
@@ -32,22 +30,6 @@ pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 // ============================================================================
 // MiningInfoBase - abstract interface for protocol-agnostic job construction
 // ============================================================================
-
-class MiningInfoBase {
-  public:
-    virtual ~MiningInfoBase();
-
-    virtual bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) = 0;
-    virtual bool isValid() const = 0;
-    virtual bool isNewWork(uint32_t &last_ntime) const = 0;
-    virtual const char* getJobId() const = 0;
-    virtual uint32_t getActiveDifficulty() const = 0;
-    virtual uint32_t getVersionMask() const = 0;
-    virtual void invalidate() = 0;
-    
-    // NIEUW: virtuele functie voor pool-grootte detectie
-    virtual int getExtranonce2Len() const { return 4; }
-};
 
 MiningInfoBase::~MiningInfoBase() {}
 
@@ -89,16 +71,21 @@ class MiningInfoV1 : public MiningInfoBase {
 
     // --- MiningInfoBase interface ---
 
-    bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
+    // Let op: zorg dat buildBmJob in MiningInfoBase en asics->sendWork ook uint64_t accepteert
+    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
+        // the parser only accepts 1..MAX_EXTRANONCE_2_LEN, never size a stack buffer from the pool
         if (extranonce_2_len < 1 || extranonce_2_len > MAX_EXTRANONCE_2_LEN) {
             ESP_LOGE(TAG, "invalid extranonce2 size %d", extranonce_2_len);
             return nullptr;
         }
 
+        // generate extranonce2 hex string (64-bit ondersteuning)
         char extranonce_2_str[MAX_EXTRANONCE_2_LEN * 2 + 1]; // +1 zero termination
-        snprintf(extranonce_2_str, extranonce_2_len * 2 + 1, "%0*lx", (int) extranonce_2_len * 2, (unsigned long) extranonce_2);
+        snprintf(extranonce_2_str, extranonce_2_len * 2 + 1, "%0*llx", (int) extranonce_2_len * 2,
+                 (unsigned long long) extranonce_2);
 
+        // generate coinbase tx
         int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) + strlen(extranonce_2_str) +
                               strlen(current_job->coinbase_2);
         char *coinbase_tx = (char *) MALLOC(coinbase_tx_len + 1);
@@ -109,11 +96,13 @@ class MiningInfoV1 : public MiningInfoBase {
         snprintf(coinbase_tx, coinbase_tx_len + 1, "%s%s%s%s", current_job->coinbase_1, extranonce_str,
                  extranonce_2_str, current_job->coinbase_2);
 
+        // calculate merkle root
         char merkle_root[65];
         calculate_merkle_root_hash(coinbase_tx, current_job->_merkle_branches, current_job->n_merkle_branches,
                                    merkle_root);
         free(coinbase_tx);
 
+        // we need malloc because we will save it in the job array
         bm_job *next_job = (bm_job *) MALLOC(sizeof(bm_job));
         if (!next_job) {
             ESP_LOGE(TAG, "no memory for job");
@@ -168,9 +157,6 @@ class MiningInfoV1 : public MiningInfoBase {
         safe_free(current_job->coinbase_1);
         safe_free(current_job->coinbase_2);
     }
-    
-    // NIEUW: override voor de base class
-    int getExtranonce2Len() const override { return extranonce_2_len; }
 
     // --- V1-specific methods ---
 
@@ -215,7 +201,6 @@ class MiningInfoV1 : public MiningInfoBase {
         safe_free(current_job->coinbase_2);
 
         memcpy(current_job, notify, sizeof(mining_notify));
-        
         current_job->job_id = strdup(notify->job_id);
         current_job->coinbase_1 = strdup(notify->coinbase_1);
         current_job->coinbase_2 = strdup(notify->coinbase_2);
@@ -224,70 +209,9 @@ class MiningInfoV1 : public MiningInfoBase {
     }
 };
 
+// Global mining info instances - one per pool slot
 static MiningInfoV1 s_miningInfoV1[2] = {MiningInfoV1{}, MiningInfoV1{}};
 MiningInfoBase* miningInfo[2] = {&s_miningInfoV1[0], &s_miningInfoV1[1]};
-
-// ============================================================================
-// NIEUW: Random Extranonce2 Logic
-// ============================================================================
-struct EnonceRandomState {
-    int      max_hex      = 0;
-    int      hex_digits   = 4;
-    int      randoms_done = 0;
-    bool     leading      = false;
-    uint32_t last_random  = 0;
-};
-static EnonceRandomState s_enonce_rand[2];
-static int               s_enonce_rand_maxhex[2] = {-1, -1};
-
-static uint32_t next_random_extranonce2_esp32(int pool, int extranonce_2_len)
-{
-    EnonceRandomState &s = s_enonce_rand[pool];
-    int max_hex = extranonce_2_len * 2;
-    
-    // ESP32 uint32_t limit (max 8 hex chars)
-    if (max_hex > 8) max_hex = 8;
-
-    if (s_enonce_rand_maxhex[pool] != max_hex) {
-        // pool changed size (or first call) -> RESET
-        s.max_hex      = max_hex;
-        s.hex_digits   = (max_hex >= 4) ? 4 : (max_hex > 0 ? max_hex : 1);
-        s.randoms_done = 0;
-        s.leading      = false;
-        s.last_random  = 0;
-        s_enonce_rand_maxhex[pool] = max_hex;
-    }
-    if (s.max_hex <= 0) return 0;
-    if (s.hex_digits < 1) s.hex_digits = 1;
-    if (s.hex_digits > s.max_hex) {
-        int start = (s.max_hex >= 4) ? 4 : s.max_hex;
-        if (start < 1) start = 1;
-        s.hex_digits   = start;
-        s.randoms_done = 0;
-        s.leading      = false;
-    }
-
-    int digits = s.hex_digits;
-    uint32_t value;
-    
-    if (!s.leading) {
-        uint32_t mask = (digits >= 8) ? 0xFFFFFFFFu : ((1u << (digits * 4)) - 1u);
-        s.last_random = esp_random() & mask;
-        value     = s.last_random;
-        s.leading = true;
-    } else {
-        int shift = (s.max_hex - digits) * 4;
-        value = (shift >= 32) ? 0u : (s.last_random << shift);
-        s.leading      = false;
-        s.randoms_done++;
-        if (s.randoms_done >= 1) {
-            s.hex_digits++;
-            s.randoms_done = 0;
-        }
-    }
-    return value;
-}
-// ============================================================================
 
 #define min(a, b) ((a < b) ? (a) : (b))
 #define max(a, b) ((a > b) ? (a) : (b))
@@ -358,6 +282,55 @@ void create_job_invalidate(int pool)
     asicJobs.cleanJobs(pool);
 }
 
+// Genereert een random extranonce2 met oplopend aantal hex-cijfers (startend bij 4),
+// aangevuld met nullen, en test elke waarde eerst rechts en daarna links uitgelijnd.
+static uint64_t get_next_custom_extranonce2(int extranonce_2_len)
+{
+    int max_hex_digits = extranonce_2_len * 2;
+    if (max_hex_digits > 16) max_hex_digits = 16;
+    if (max_hex_digits < 1) return 0;
+
+    int start_digits = (max_hex_digits >= 4) ? 4 : 1;
+
+    static int current_digits = 4;
+    static uint64_t current_rand_val = 0;
+    static bool send_left_aligned = false;
+
+    if (current_digits > max_hex_digits || current_digits < start_digits) {
+        current_digits = start_digits;
+        send_left_aligned = false;
+    }
+
+    uint64_t result = 0;
+
+    if (!send_left_aligned) {
+        uint64_t r = ((uint64_t) esp_random() << 32) | esp_random();
+        uint64_t mask = (current_digits == 16) ? UINT64_MAX : ((1ULL << (current_digits * 4)) - 1);
+        current_rand_val = r & mask;
+
+        uint64_t min_val = 1ULL << ((current_digits - 1) * 4);
+        if (current_rand_val < min_val) {
+            current_rand_val |= min_val;
+        }
+
+        // Rechts uitgelijnd (bijv. 0000000000003951)
+        result = current_rand_val;
+        send_left_aligned = true;
+    } else {
+        // Links uitgelijnd (bijv. 3951000000000000)
+        int shift_bits = (max_hex_digits - current_digits) * 4;
+        result = current_rand_val << shift_bits;
+
+        send_left_aligned = false;
+        current_digits++;
+        if (current_digits > max_hex_digits) {
+            current_digits = start_digits;
+        }
+    }
+
+    return result;
+}
+
 void create_jobs_task(void *pvParameters)
 {
     Board *board = SYSTEM_MODULE.getBoard();
@@ -381,8 +354,11 @@ void create_jobs_task(void *pvParameters)
 
     uint32_t last_ntime[2]{0};
     uint64_t last_submit_time = 0;
-    
+    uint64_t extranonce_2 = 0;
+
+    // CAN: per-slave rolling counters (upper 7 bits = slave_id, lower 25 = counter)
     uint32_t slave_counters[CAN_SLAVE_MAX] = {0};
+
     int lastJobInterval = board->getAsicJobIntervalMs();
 
     while (1) {
@@ -391,10 +367,9 @@ void create_jobs_task(void *pvParameters)
             vTaskSuspend(NULL);
         }
         pthread_mutex_lock(&job_mutex);
-        pthread_cond_wait(&job_cond, &job_mutex); // Wait for the timer or external trigger
+        pthread_cond_wait(&job_cond, &job_mutex);
         pthread_mutex_unlock(&job_mutex);
 
-        // job interval changed via UI
         if (board->getAsicJobIntervalMs() != lastJobInterval) {
             xTimerChangePeriod(job_timer, pdMS_TO_TICKS(board->getAsicJobIntervalMs()), 0);
             lastJobInterval = board->getAsicJobIntervalMs();
@@ -404,20 +379,17 @@ void create_jobs_task(void *pvParameters)
         bm_job *next_job = nullptr;
         int active_pool = 0;
         const char *active_pool_str = "";
-        uint32_t e2 = 0; // NIEUW: variabele voor de random extranonce2
 
         if (!STRATUM_MANAGER) {
             continue;
         }
 
-        // select pool to mine for
         active_pool = STRATUM_MANAGER->getNextActivePool();
         active_pool_str = active_pool ? "Sec" : "Pri";
 
         { // scope for mutex
             PThreadGuard g(current_stratum_job_mutex);
 
-            // set current pool data
             MiningInfoBase *mi = miningInfo[active_pool];
 
             if (!mi->isValid() || !asics) {
@@ -428,19 +400,17 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
-            // NIEUW: Genereer random extranonce op basis van pool-grootte
-            e2 = next_random_extranonce2_esp32(active_pool, mi->getExtranonce2Len());
+            int allowed_len = s_miningInfoV1[active_pool].extranonce_2_len;
+            extranonce_2 = get_next_custom_extranonce2(allowed_len);
 
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
-            next_job = mi->buildBmJob(e2, active_pool, asic_diff);
+            next_job = mi->buildBmJob(extranonce_2, active_pool, asic_diff);
         } // mutex
 
-        // out of memory or invalid pool parameters, try again on the next tick
         if (!next_job) {
             continue;
         }
 
-        // set asic difficulty
         asics->setJobDifficultyMask(next_job->asic_diff);
 
         uint64_t current_time = esp_timer_get_time();
@@ -449,17 +419,16 @@ void create_jobs_task(void *pvParameters)
         }
         last_submit_time = current_time;
 
-        int asic_job_id = asics->sendWork(e2, next_job);
+        int asic_job_id = asics->sendWork(extranonce_2, next_job);
 
         ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X", active_pool_str, active_pool, asic_job_id);
 
-        // save job
         asicJobs.storeJob(next_job, asic_job_id);
 
         // --- CAN: send raw job to each slave ---
         for (uint8_t slave = 0; slave < CAN_SLAVE_MAX; slave++) {
             if (!can_master_is_slave_active(slave)) continue;
-            uint32_t e2_slave = can_make_extranonce2(slave, slave_counters[slave]++);
+            uint32_t e2 = can_make_extranonce2(slave, slave_counters[slave]++);
 
             bm_job *slave_job = nullptr;
             {
@@ -467,7 +436,7 @@ void create_jobs_task(void *pvParameters)
                 MiningInfoBase *mi = miningInfo[active_pool];
                 if (mi->isValid()) {
                     uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
-                    slave_job = mi->buildBmJob(e2_slave, active_pool, asic_diff);
+                    slave_job = mi->buildBmJob(e2, active_pool, asic_diff);
                 }
             }
 
