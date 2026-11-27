@@ -69,22 +69,18 @@ class MiningInfoV1 : public MiningInfoBase {
         }
     }
 
-    // --- MiningInfoBase interface ---
-
-    bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
+    // 64-bit versie voor de volledige 8-byte extranonce2 (16 hex-cijfers)
+    bm_job* buildBmJob64(uint64_t extranonce_2, int pool_id, uint32_t asic_diff)
     {
-        // the parser only accepts 1..MAX_EXTRANONCE_2_LEN, never size a stack buffer from the pool
         if (extranonce_2_len < 1 || extranonce_2_len > MAX_EXTRANONCE_2_LEN) {
             ESP_LOGE(TAG, "invalid extranonce2 size %d", extranonce_2_len);
             return nullptr;
         }
 
-        // generate extranonce2 hex string (64-bit tot 16 hex-cijfers)
-        char extranonce_2_str[MAX_EXTRANONCE_2_LEN * 2 + 1]; // +1 zero termination
+        char extranonce_2_str[MAX_EXTRANONCE_2_LEN * 2 + 1];
         snprintf(extranonce_2_str, extranonce_2_len * 2 + 1, "%0*llx", (int) extranonce_2_len * 2,
                  (unsigned long long) extranonce_2);
 
-        // generate coinbase tx
         int coinbase_tx_len = strlen(current_job->coinbase_1) + strlen(extranonce_str) + strlen(extranonce_2_str) +
                               strlen(current_job->coinbase_2);
         char *coinbase_tx = (char *) MALLOC(coinbase_tx_len + 1);
@@ -95,13 +91,11 @@ class MiningInfoV1 : public MiningInfoBase {
         snprintf(coinbase_tx, coinbase_tx_len + 1, "%s%s%s%s", current_job->coinbase_1, extranonce_str,
                  extranonce_2_str, current_job->coinbase_2);
 
-        // calculate merkle root
         char merkle_root[65];
         calculate_merkle_root_hash(coinbase_tx, current_job->_merkle_branches, current_job->n_merkle_branches,
                                    merkle_root);
         free(coinbase_tx);
 
-        // we need malloc because we will save it in the job array
         bm_job *next_job = (bm_job *) MALLOC(sizeof(bm_job));
         if (!next_job) {
             ESP_LOGE(TAG, "no memory for job");
@@ -115,6 +109,13 @@ class MiningInfoV1 : public MiningInfoBase {
         next_job->asic_diff = asic_diff;
 
         return next_job;
+    }
+
+    // --- MiningInfoBase interface (behoudt uint32_t voor compatibiliteit met CAN & V2) ---
+
+    bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
+    {
+        return buildBmJob64((uint64_t) extranonce_2, pool_id, asic_diff);
     }
 
     bool isValid() const override
@@ -397,11 +398,16 @@ void create_jobs_task(void *pvParameters)
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
             }
 
-            int allowed_len = s_miningInfoV1[active_pool].extranonce_2_len;
-            extranonce_2 = get_next_custom_extranonce2(allowed_len);
-
             uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
-            next_job = mi->buildBmJob(extranonce_2, active_pool, asic_diff);
+
+            if (mi == &s_miningInfoV1[active_pool]) {
+                int allowed_len = s_miningInfoV1[active_pool].extranonce_2_len;
+                extranonce_2 = get_next_custom_extranonce2(allowed_len);
+                next_job = s_miningInfoV1[active_pool].buildBmJob64(extranonce_2, active_pool, asic_diff);
+            } else {
+                extranonce_2 = (uint32_t) get_next_custom_extranonce2(4);
+                next_job = mi->buildBmJob((uint32_t) extranonce_2, active_pool, asic_diff);
+            }
         } // mutex
 
         if (!next_job) {
@@ -416,7 +422,7 @@ void create_jobs_task(void *pvParameters)
         }
         last_submit_time = current_time;
 
-        int asic_job_id = asics->sendWork(extranonce_2, next_job);
+        int asic_job_id = asics->sendWork((uint32_t) extranonce_2, next_job);
 
         ESP_LOGD(TAG, "(%s) Sent Job (%d): %02X", active_pool_str, active_pool, asic_job_id);
 
