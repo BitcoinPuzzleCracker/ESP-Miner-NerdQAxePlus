@@ -71,7 +71,6 @@ class MiningInfoV1 : public MiningInfoBase {
 
     // --- MiningInfoBase interface ---
 
-    // Let op: zorg dat buildBmJob in MiningInfoBase en asics->sendWork ook uint64_t accepteert
     bm_job* buildBmJob(uint64_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
         // the parser only accepts 1..MAX_EXTRANONCE_2_LEN, never size a stack buffer from the pool
