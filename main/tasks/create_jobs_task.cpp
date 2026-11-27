@@ -27,6 +27,10 @@ pthread_cond_t job_cond = PTHREAD_COND_INITIALIZER;
 
 pthread_mutex_t current_stratum_job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Vlag om version/nonce rolling te resetten zodra er nieuwe blokgegevens binnenkomen
+static volatile bool g_reset_rolling_on_new_block = true;
+static uint32_t g_roll_step = 0;
+
 // ============================================================================
 // MiningInfoBase - abstract interface for protocol-agnostic job construction
 // ============================================================================
@@ -49,6 +53,7 @@ class MiningInfoV1 : public MiningInfoBase {
 
     uint32_t stratum_difficulty = 8192;
     uint32_t active_stratum_difficulty = 8192;
+    uint32_t pool_version_mask = 0;
     uint32_t version_mask = 0;
 
   public:
@@ -69,7 +74,30 @@ class MiningInfoV1 : public MiningInfoBase {
         }
     }
 
-    // 64-bit versie voor de volledige 8-byte extranonce2 (16 hex-cijfers)
+    // Past een rolling-stap toe binnen de door de pool toegestane version-bits
+    uint32_t compute_rolled_version_mask(uint32_t base_mask, uint32_t step) const
+    {
+        if (base_mask == 0) {
+            return 0;
+        }
+        // Gebruik een stap in de rolling-bits (BIP320 version bits liggen in 0x1fffe000)
+        uint32_t roll_bits = ((step * 0x2000U) & 0x1fffe000U);
+        uint32_t effective = (base_mask ^ roll_bits) & base_mask;
+        return (effective != 0) ? effective : base_mask;
+    }
+
+    void reset_version_rolling()
+    {
+        g_roll_step = 0;
+        version_mask = compute_rolled_version_mask(pool_version_mask, g_roll_step);
+    }
+
+    void step_version_rolling()
+    {
+        g_roll_step++;
+        version_mask = compute_rolled_version_mask(pool_version_mask, g_roll_step);
+    }
+
     bm_job* buildBmJob64(uint64_t extranonce_2, int pool_id, uint32_t asic_diff)
     {
         if (extranonce_2_len < 1 || extranonce_2_len > MAX_EXTRANONCE_2_LEN) {
@@ -77,6 +105,7 @@ class MiningInfoV1 : public MiningInfoBase {
             return nullptr;
         }
 
+        // extranonce2 staat vast op 0 -> bij 8 bytes: "0000000000000000"
         char extranonce_2_str[MAX_EXTRANONCE_2_LEN * 2 + 1];
         snprintf(extranonce_2_str, extranonce_2_len * 2 + 1, "%0*llx", (int) extranonce_2_len * 2,
                  (unsigned long long) extranonce_2);
@@ -111,7 +140,7 @@ class MiningInfoV1 : public MiningInfoBase {
         return next_job;
     }
 
-    // --- MiningInfoBase interface (behoudt uint32_t voor compatibiliteit met CAN & V2) ---
+    // --- MiningInfoBase interface ---
 
     bm_job* buildBmJob(uint32_t extranonce_2, int pool_id, uint32_t asic_diff) override
     {
@@ -162,7 +191,8 @@ class MiningInfoV1 : public MiningInfoBase {
 
     void set_version_mask(uint32_t mask)
     {
-        version_mask = mask;
+        pool_version_mask = mask;
+        version_mask = compute_rolled_version_mask(pool_version_mask, g_roll_step);
     }
 
     bool set_difficulty(uint32_t difficulty)
@@ -188,6 +218,10 @@ class MiningInfoV1 : public MiningInfoBase {
 
     void create_job_mining_notify(mining_notify *notify)
     {
+        bool job_changed = (!current_job->job_id || !notify->job_id ||
+                            strcmp(current_job->job_id, notify->job_id) != 0 ||
+                            current_job->ntime != notify->ntime);
+
         if (next_extranonce_str) {
             safe_free(extranonce_str);
             extranonce_str = strdup(next_extranonce_str);
@@ -206,6 +240,11 @@ class MiningInfoV1 : public MiningInfoBase {
         current_job->coinbase_2 = strdup(notify->coinbase_2);
 
         active_stratum_difficulty = stratum_difficulty;
+
+        if (job_changed) {
+            g_reset_rolling_on_new_block = true;
+            reset_version_rolling();
+        }
     }
 };
 
@@ -282,51 +321,12 @@ void create_job_invalidate(int pool)
     asicJobs.cleanJobs(pool);
 }
 
-// Genereert een random extranonce2 met oplopend aantal hex-cijfers (startend bij 4),
-// en stuurt eerst 0000000000003951 en direct daarna 3951000000000000.
-static uint64_t get_next_custom_extranonce2(int extranonce_2_len)
+// extranonce2 blijft altijd 0ULL ("0000000000000000" bij 8 bytes)
+static uint64_t get_next_custom_extranonce2(int extranonce_2_len, bool reset_now)
 {
-    int max_hex_digits = extranonce_2_len * 2;
-    if (max_hex_digits > 16) max_hex_digits = 16;
-    if (max_hex_digits < 1) return 0;
-
-    int start_digits = (max_hex_digits >= 4) ? 4 : 1;
-
-    static int current_digits = 4;
-    static uint64_t current_rand_val = 0;
-    static bool send_shifted_left = false;
-
-    if (current_digits > max_hex_digits || current_digits < start_digits) {
-        current_digits = start_digits;
-        send_shifted_left = false;
-    }
-
-    if (!send_shifted_left) {
-        uint64_t r = ((uint64_t) esp_random() << 32) | esp_random();
-        uint64_t mask = (current_digits == 16) ? UINT64_MAX : ((1ULL << (current_digits * 4)) - 1);
-        current_rand_val = r & mask;
-
-        uint64_t min_val = 1ULL << ((current_digits - 1) * 4);
-        if (current_rand_val < min_val) {
-            current_rand_val |= min_val;
-        }
-
-        // Eerst bijv. 0000000000003951
-        send_shifted_left = true;
-        return current_rand_val;
-    } else {
-        // Daarna bijv. 3951000000000000
-        int shift_bits = (max_hex_digits - current_digits) * 4;
-        uint64_t shifted_val = current_rand_val << shift_bits;
-
-        send_shifted_left = false;
-        current_digits++;
-        if (current_digits > max_hex_digits) {
-            current_digits = start_digits;
-        }
-
-        return shifted_val;
-    }
+    (void) extranonce_2_len;
+    (void) reset_now;
+    return 0ULL;
 }
 
 void create_jobs_task(void *pvParameters)
@@ -394,18 +394,28 @@ void create_jobs_task(void *pvParameters)
                 continue;
             }
 
-            if (mi->isNewWork(last_ntime[active_pool])) {
+            bool is_new_work = mi->isNewWork(last_ntime[active_pool]);
+            if (is_new_work) {
                 ESP_LOGI(TAG, "(%s) New Work Received %s", active_pool_str, mi->getJobId());
+                g_reset_rolling_on_new_block = true;
             }
 
-            uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
+            bool do_reset = g_reset_rolling_on_new_block;
+            g_reset_rolling_on_new_block = false;
 
             if (mi == &s_miningInfoV1[active_pool]) {
+                if (do_reset) {
+                    s_miningInfoV1[active_pool].reset_version_rolling();
+                } else {
+                    s_miningInfoV1[active_pool].step_version_rolling();
+                }
                 int allowed_len = s_miningInfoV1[active_pool].extranonce_2_len;
-                extranonce_2 = get_next_custom_extranonce2(allowed_len);
+                extranonce_2 = get_next_custom_extranonce2(allowed_len, do_reset);
+                uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
                 next_job = s_miningInfoV1[active_pool].buildBmJob64(extranonce_2, active_pool, asic_diff);
             } else {
-                extranonce_2 = (uint32_t) get_next_custom_extranonce2(4);
+                extranonce_2 = (uint32_t) get_next_custom_extranonce2(4, do_reset);
+                uint32_t asic_diff = STRATUM_MANAGER->selectAsicDiff(active_pool, mi->getActiveDifficulty());
                 next_job = mi->buildBmJob((uint32_t) extranonce_2, active_pool, asic_diff);
             }
         } // mutex
